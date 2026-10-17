@@ -11,19 +11,27 @@ DB_NAME = "store_prices.db"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP & AUTO-MIGRATION ---
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 barcode TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                price TEXT NOT NULL,
-                category TEXT,
-                source_tab TEXT,
+                price_cx TEXT DEFAULT '',
+                price_emb TEXT DEFAULT '',
+                price_pc_kgm TEXT DEFAULT '',
+                price_bag TEXT DEFAULT '',
                 updated_at TEXT
             )
         """)
+        # Auto-migrate if older table structure exists
+        existing_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()
+        ]
+        for col in ["price_cx", "price_emb", "price_pc_kgm", "price_bag", "updated_at"]:
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE products ADD COLUMN {col} TEXT DEFAULT ''")
         conn.commit()
 
 
@@ -40,7 +48,21 @@ def clean_barcode(val):
     return s
 
 
-# --- HTML TEMPLATE (LOGIN + SCANNER + MANAGER PORTAL) ---
+def format_price(val):
+    """Formats price values cleanly from Excel cells."""
+    if val is None or pd.isna(val):
+        return ""
+    if isinstance(val, (int, float)):
+        if float(val) == 0:
+            return ""
+        return f"{val:,.2f}"
+    s = str(val).strip()
+    if s in ["", "-", "0", "0.0", "0.00", "nan", "None"]:
+        return ""
+    return s
+
+
+# --- HTML TEMPLATE (LOGIN + SCANNER + 4-PRICE MANAGER PORTAL) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -60,10 +82,10 @@ HTML_TEMPLATE = """
                 🔐
             </div>
             <h2 class="text-xl font-extrabold text-slate-800">Store Portal Login</h2>
-            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee or Manager access</p>
+            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee (123) or Manager (321)</p>
 
             <input type="password" id="login-pin" autofocus
-                placeholder="Enter Password (123 or 321)"
+                placeholder="Enter Password"
                 class="w-full px-4 py-3 text-center text-xl tracking-widest font-bold border-2 border-indigo-300 rounded-xl focus:outline-none focus:border-indigo-600 mb-3">
             
             <p id="login-error" class="text-xs font-bold text-red-600 mb-3 hidden">❌ Wrong Password! Try again.</p>
@@ -113,7 +135,6 @@ HTML_TEMPLATE = """
                         <button type="button" onclick="toggleCamera()" id="inline-scan-btn"
                             title="Open QR / Barcode Camera Scanner"
                             class="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg border border-indigo-200 transition flex items-center justify-center shadow-sm">
-                            <!-- Barcode/QR SVG Icon -->
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                                 <path stroke-linecap="round" stroke-linejoin="round" d="M3 7V5a2 2 0 012-2h2m10 0h2a2 2 0 012 2v2m0 10v2a2 2 0 01-2 2h-2M7 21H5a2 2 0 01-2-2v-2M7 8h1v8H7V8zm3 0h2v8h-2V8zm4 0h1v8h-1V8zm3 0h1v8h-1V8z" />
                             </svg>
@@ -125,7 +146,7 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
 
-                <!-- Mobile/Web Camera Container (Opens when small icon is clicked) -->
+                <!-- Mobile/Web Camera Container -->
                 <div id="reader-container" class="hidden mt-4 bg-slate-900 p-3 rounded-2xl max-w-sm mx-auto text-center">
                     <div class="flex justify-between items-center text-white text-xs font-semibold mb-2 px-1">
                         <span>📷 Point camera at Barcode or QR Code</span>
@@ -136,7 +157,7 @@ HTML_TEMPLATE = """
             </div>
 
             <!-- Price Display Result Card -->
-            <div id="price-result" class="hidden"></div>
+            <div id="price-result" class="hidden space-y-4"></div>
         </div>
 
         <!-- ================= MANAGER UPLOAD VIEW ================= -->
@@ -144,13 +165,13 @@ HTML_TEMPLATE = """
             
             <!-- Step 1: Upload Excel -->
             <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200">
-                <div class="flex justify-between items-center mb-4">
+                <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
                     <div>
-                        <h2 class="text-xl font-bold text-slate-800">1. Upload Daily Price Excel</h2>
-                        <p class="text-sm text-slate-500">Upload .xlsx, .xls, or .csv file to map tabs and columns</p>
+                        <h2 class="text-xl font-bold text-slate-800">1. Upload Daily Price Excel (Auto-Merge)</h2>
+                        <p class="text-sm text-slate-500">New articles will be added & existing article prices will be updated automatically</p>
                     </div>
                     <span class="bg-indigo-50 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-full border border-indigo-200" id="total-count-badge">
-                        Total Articles: {{ total_products }}
+                        Total Articles in DB: {{ total_products }}
                     </span>
                 </div>
 
@@ -168,8 +189,8 @@ HTML_TEMPLATE = """
             <!-- Step 2: Dynamic Tab & Column Mapping -->
             <div id="mapping-section" class="hidden bg-white p-6 rounded-2xl shadow-md border border-slate-200 space-y-5">
                 <div>
-                    <h2 class="text-xl font-bold text-slate-800">2. Select Which Column for Which Tab</h2>
-                    <p class="text-sm text-slate-500">Check the tabs you want to import and choose the matching column for each field.</p>
+                    <h2 class="text-xl font-bold text-slate-800">2. Select Columns for Each Tab</h2>
+                    <p class="text-sm text-slate-500">Map Barcode, Article Name, and the 4 Price columns (CX, EMB, PC/KGM, BAG) for each tab.</p>
                 </div>
 
                 <div id="tabs-container" class="space-y-6"></div>
@@ -177,7 +198,7 @@ HTML_TEMPLATE = """
                 <div class="pt-4 border-t border-slate-200 flex justify-end">
                     <button onclick="confirmAndImport()" id="btn-confirm-import"
                         class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-8 py-3 rounded-xl shadow-lg text-base">
-                        ✅ Save & Update Daily Prices
+                        ✅ Merge & Update Prices
                     </button>
                 </div>
             </div>
@@ -190,13 +211,13 @@ HTML_TEMPLATE = """
         // --- PASSWORDS ---
         const EMPLOYEE_PASS = "123";
         const MANAGER_PASS = "321";
-        let currentRole = null; // 'employee' or 'manager'
+        let currentRole = null;
 
         let currentTempFile = null;
         let html5QrCode = null;
         let cameraActive = false;
 
-        // --- SUPERMARKET BEEP SOUND (Web Audio API - No external MP3 needed) ---
+        // --- SUPERMARKET BEEP SOUND ---
         function playBeep() {
             try {
                 const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -205,14 +226,14 @@ HTML_TEMPLATE = """
                 const gain = ctx.createGain();
 
                 osc.type = "sine";
-                osc.frequency.setValueAtTime(1350, ctx.currentTime); // High-pitched store scanner beep
+                osc.frequency.setValueAtTime(1350, ctx.currentTime);
                 gain.gain.setValueAtTime(0.25, ctx.currentTime);
 
                 osc.connect(gain);
                 gain.connect(ctx.destination);
 
                 osc.start();
-                osc.stop(ctx.currentTime + 0.14); // 140ms crisp beep
+                osc.stop(ctx.currentTime + 0.14);
             } catch (e) {
                 console.log("Audio beep error:", e);
             }
@@ -262,10 +283,9 @@ HTML_TEMPLATE = """
             document.getElementById('login-pin').focus();
         }
 
-        // Switch between Employee Scanner and Manager View
         function switchMode(mode) {
             if (mode === 'manager' && currentRole !== 'manager') {
-                const askPin = prompt("🔒 Enter Manager Password to access Upload section:");
+                const askPin = prompt("🔒 Enter Manager Password (321) to access Upload section:");
                 if (askPin === MANAGER_PASS) {
                     currentRole = 'manager';
                     updateRoleBadge("👔 Manager");
@@ -303,7 +323,21 @@ HTML_TEMPLATE = """
             }
         });
 
-        // Search Article by Barcode or Name in Database
+        // Helper to render each of the 4 price boxes cleanly
+        function renderPriceBox(label, subLabel, value, colorClass) {
+            const hasPrice = value && value.trim() !== "";
+            return `
+                <div class="${hasPrice ? colorClass : 'bg-slate-50 border-slate-200 opacity-60'} border-2 rounded-2xl p-4 text-center shadow-sm transition">
+                    <span class="text-xs font-extrabold uppercase tracking-wider block text-slate-600">${label}</span>
+                    <span class="text-[11px] text-slate-400 block mb-1">${subLabel}</span>
+                    <span class="${hasPrice ? 'text-2xl sm:text-3xl font-black text-slate-900' : 'text-xl font-bold text-slate-400'} block mt-1">
+                        ${hasPrice ? value : '--'}
+                    </span>
+                </div>
+            `;
+        }
+
+        // Search Article in Background and Show Only Code, Name & 4 Prices
         async function searchArticle(overrideQuery = null) {
             const inputEl = document.getElementById('scan-input');
             const query = (overrideQuery !== null ? overrideQuery : inputEl.value).trim();
@@ -311,7 +345,7 @@ HTML_TEMPLATE = """
 
             const resultBox = document.getElementById('price-result');
             resultBox.classList.remove('hidden');
-            resultBox.innerHTML = `<div class="bg-white p-6 rounded-2xl shadow text-center text-slate-500">Searching article in database...</div>`;
+            resultBox.innerHTML = `<div class="bg-white p-6 rounded-2xl shadow text-center text-slate-500 font-medium">⏳ Fetching price details...</div>`;
 
             try {
                 const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
@@ -321,22 +355,27 @@ HTML_TEMPLATE = """
                     resultBox.innerHTML = `
                         <div class="bg-red-50 border-2 border-red-300 p-6 rounded-2xl text-center">
                             <p class="text-2xl font-bold text-red-600">❌ Article Not Found</p>
-                            <p class="text-slate-600 mt-1">No price record found for: <strong>${query}</strong></p>
+                            <p class="text-slate-600 mt-1">No record found for: <strong>${query}</strong></p>
                         </div>`;
                 } else {
                     resultBox.innerHTML = data.items.map(item => `
-                        <div class="bg-white border-2 border-emerald-500 p-6 rounded-2xl shadow-lg mb-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-                            <div>
-                                <span class="text-xs font-bold uppercase tracking-wider bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md">
-                                    Barcode: ${item.barcode}
-                                </span>
-                                ${item.category ? `<span class="ml-2 text-xs font-bold uppercase bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-md">${item.category}</span>` : ''}
-                                <h3 class="text-2xl font-extrabold text-slate-800 mt-2">${item.name}</h3>
-                                <p class="text-xs text-slate-400 mt-1">Tab: ${item.source_tab} • Updated: ${item.updated_at}</p>
+                        <div class="bg-white border-2 border-indigo-500 p-6 rounded-2xl shadow-lg space-y-5">
+                            <!-- Article Code & Article Name Header -->
+                            <div class="border-b border-slate-200 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                <div>
+                                    <span class="text-xs font-extrabold uppercase tracking-wider bg-indigo-100 text-indigo-800 px-3 py-1 rounded-lg">
+                                        Article Code: ${item.barcode}
+                                    </span>
+                                    <h3 class="text-2xl sm:text-3xl font-black text-slate-900 mt-2">${item.name}</h3>
+                                </div>
                             </div>
-                            <div class="bg-emerald-50 border border-emerald-200 px-6 py-4 rounded-2xl text-right w-full sm:w-auto">
-                                <span class="text-xs uppercase font-bold text-emerald-700 block">Selling Price</span>
-                                <span class="text-4xl font-black text-emerald-600">${item.price}</span>
+
+                            <!-- 4 Price Types Grid -->
+                            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+                                ${renderPriceBox('Price of CX', 'Box / Caixa', item.price_cx, 'bg-emerald-50 border-emerald-400')}
+                                ${renderPriceBox('Price of EMB', 'Pack / Embalagem', item.price_emb, 'bg-blue-50 border-blue-400')}
+                                ${renderPriceBox('Price of PC or KGM', 'Unit / Kg', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
+                                ${renderPriceBox('Price of BAG', 'Bag / Saco', item.price_bag, 'bg-purple-50 border-purple-400')}
                             </div>
                         </div>
                     `).join('');
@@ -365,13 +404,9 @@ HTML_TEMPLATE = """
                     { facingMode: "environment" },
                     { fps: 12, qrbox: { width: 250, height: 150 } },
                     (decodedText) => {
-                        // 1. Play Beep Sound immediately
                         playBeep();
-                        // 2. Put barcode into search input
                         document.getElementById('scan-input').value = decodedText;
-                        // 3. Stop camera automatically
                         stopCamera();
-                        // 4. Fetch and display database details below
                         searchArticle(decodedText);
                     },
                     (errorMessage) => {}
@@ -396,7 +431,7 @@ HTML_TEMPLATE = """
             document.getElementById('reader-container').classList.add('hidden');
         }
 
-        // Step 1: Upload Excel and Get Tabs + Columns
+        // --- MANAGER EXCEL UPLOAD & COLUMN MAPPING ---
         async function uploadForPreview() {
             const fileInput = document.getElementById('excel-file');
             const statusEl = document.getElementById('upload-status');
@@ -427,7 +462,7 @@ HTML_TEMPLATE = """
 
                 currentTempFile = data.temp_filename;
                 statusEl.className = "mt-3 text-sm font-medium text-emerald-600";
-                statusEl.innerText = `✅ Found ${data.tabs.length} tab(s) in workbook. Map the columns below:`;
+                statusEl.innerText = `✅ Found ${data.tabs.length} tab(s). Select the columns below for each tab:`;
 
                 renderTabMappings(data.tabs);
             } catch (err) {
@@ -436,7 +471,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Helper to auto-guess column names
         function guessColumn(columns, keywords) {
             for (const col of columns) {
                 const lower = col.toLowerCase();
@@ -445,20 +479,21 @@ HTML_TEMPLATE = """
             return "";
         }
 
-        // Render Column Selectors for Each Tab
         function renderTabMappings(tabs) {
             const section = document.getElementById('mapping-section');
             const container = document.getElementById('tabs-container');
             section.classList.remove('hidden');
 
             container.innerHTML = tabs.map((tab) => {
-                const barcodeGuess = guessColumn(tab.columns, ['barcode', 'code', 'sku', 'art', 'ean', 'id']);
+                const barcodeGuess = guessColumn(tab.columns, ['barcode', 'code', 'cod', 'sku', 'art', 'ean', 'id']);
                 const nameGuess = guessColumn(tab.columns, ['name', 'desc', 'product', 'article', 'item', 'nome']);
-                const priceGuess = guessColumn(tab.columns, ['price', 'rate', 'mrp', 'preco', 'preço', 'valor', 'amount']);
-                const catGuess = guessColumn(tab.columns, ['cat', 'dept', 'group', 'unit', 'brand']);
+                const cxGuess = guessColumn(tab.columns, ['cx', 'caixa', 'box', 'carton']);
+                const embGuess = guessColumn(tab.columns, ['emb', 'pack', 'pct', 'fardo']);
+                const pcGuess = guessColumn(tab.columns, ['pc', 'kgm', 'kg', 'un', 'unit', 'price', 'preco', 'preço']);
+                const bagGuess = guessColumn(tab.columns, ['bag', 'saco', 'sc']);
 
-                const makeOptions = (selectedVal, allowEmpty = false) => {
-                    let opts = allowEmpty ? `<option value="">-- Optional / Skip --</option>` : `<option value="">-- Select Column --</option>`;
+                const makeOptions = (selectedVal, placeholderText) => {
+                    let opts = `<option value="">${placeholderText}</option>`;
                     for (const col of tab.columns) {
                         const isSel = (col === selectedVal) ? "selected" : "";
                         opts += `<option value="${col}" ${isSel}>${col}</option>`;
@@ -476,29 +511,46 @@ HTML_TEMPLATE = """
                         </label>
                     </div>
 
-                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                    <!-- Article Code & Name Mapping -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                         <div>
-                            <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Barcode / Article Code *</label>
-                            <select class="col-barcode w-full p-2.5 bg-white border border-slate-300 rounded-lg font-medium text-sm">
-                                ${makeOptions(barcodeGuess, false)}
+                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Code / Barcode *</label>
+                            <select class="col-barcode w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
+                                ${makeOptions(barcodeGuess, '-- Select Barcode Column --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Article Name *</label>
-                            <select class="col-name w-full p-2.5 bg-white border border-slate-300 rounded-lg font-medium text-sm">
-                                ${makeOptions(nameGuess, false)}
+                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Name *</label>
+                            <select class="col-name w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
+                                ${makeOptions(nameGuess, '-- Select Name Column --')}
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- 4 Price Columns Mapping -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 bg-white p-4 rounded-xl border border-slate-200">
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price of CX</label>
+                            <select class="col-price-cx w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
+                                ${makeOptions(cxGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Selling Price *</label>
-                            <select class="col-price w-full p-2.5 bg-white border border-slate-300 rounded-lg font-medium text-sm">
-                                ${makeOptions(priceGuess, false)}
+                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price of EMB</label>
+                            <select class="col-price-emb w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
+                                ${makeOptions(embGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Category / Unit (Optional)</label>
-                            <select class="col-category w-full p-2.5 bg-white border border-slate-300 rounded-lg font-medium text-sm">
-                                ${makeOptions(catGuess, true)}
+                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price of PC or KGM</label>
+                            <select class="col-price-pc w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
+                                ${makeOptions(pcGuess, '-- None / Skip --')}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price of BAG</label>
+                            <select class="col-price-bag w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
+                                ${makeOptions(bagGuess, '-- None / Skip --')}
                             </select>
                         </div>
                     </div>
@@ -521,7 +573,6 @@ HTML_TEMPLATE = """
             }).join('');
         }
 
-        // Step 2: Confirm Column Mappings and Update Database
         async function confirmAndImport() {
             const cards = document.querySelectorAll('.tab-config-card');
             const mappings = [];
@@ -533,11 +584,18 @@ HTML_TEMPLATE = """
                 const sheetName = card.getAttribute('data-tab-name');
                 const barcodeCol = card.querySelector('.col-barcode').value;
                 const nameCol = card.querySelector('.col-name').value;
-                const priceCol = card.querySelector('.col-price').value;
-                const categoryCol = card.querySelector('.col-category').value;
+                const priceCxCol = card.querySelector('.col-price-cx').value;
+                const priceEmbCol = card.querySelector('.col-price-emb').value;
+                const pricePcCol = card.querySelector('.col-price-pc').value;
+                const priceBagCol = card.querySelector('.col-price-bag').value;
 
-                if (!barcodeCol || !nameCol || !priceCol) {
-                    alert(`Please select Barcode, Article Name, and Price columns for tab: "${sheetName}"`);
+                if (!barcodeCol || !nameCol) {
+                    alert(`Please select Article Code and Article Name columns for tab: "${sheetName}"`);
+                    return;
+                }
+
+                if (!priceCxCol && !priceEmbCol && !pricePcCol && !priceBagCol) {
+                    alert(`Please select at least one Price column (CX, EMB, PC/KGM, or BAG) for tab: "${sheetName}"`);
                     return;
                 }
 
@@ -545,8 +603,10 @@ HTML_TEMPLATE = """
                     sheet_name: sheetName,
                     barcode_col: barcodeCol,
                     name_col: nameCol,
-                    price_col: priceCol,
-                    category_col: categoryCol
+                    price_cx_col: priceCxCol,
+                    price_emb_col: priceEmbCol,
+                    price_pc_col: pricePcCol,
+                    price_bag_col: priceBagCol
                 });
             }
 
@@ -557,7 +617,7 @@ HTML_TEMPLATE = """
 
             const btn = document.getElementById('btn-confirm-import');
             btn.disabled = true;
-            btn.innerText = "⏳ Updating Prices...";
+            btn.innerText = "⏳ Merging New & Existing Prices...";
 
             try {
                 const res = await fetch("/api/import-mapped", {
@@ -571,19 +631,24 @@ HTML_TEMPLATE = """
                 const data = await res.json();
 
                 btn.disabled = false;
-                btn.innerText = "✅ Save & Update Daily Prices";
+                btn.innerText = "✅ Merge & Update Prices";
 
                 if (data.success) {
-                    alert(`✅ Success! Updated ${data.imported_count} articles across ${mappings.length} tab(s).`);
-                    document.getElementById('total-count-badge').innerText = `Total Articles: ${data.total_products}`;
+                    alert(
+                        `✅ Merge Complete!\n\n` +
+                        `🆕 New Articles Added: ${data.new_added}\n` +
+                        `🔄 Existing Articles Updated: ${data.existing_updated}\n` +
+                        `📦 Total Articles in Database: ${data.total_products}`
+                    );
+                    document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.total_products}`;
                     document.getElementById('mapping-section').classList.add('hidden');
                 } else {
                     alert("❌ Error: " + data.error);
                 }
             } catch (err) {
                 btn.disabled = false;
-                btn.innerText = "✅ Save & Update Daily Prices";
-                alert("❌ Failed to import data.");
+                btn.innerText = "✅ Merge & Update Prices";
+                alert("❌ Failed to merge data.");
             }
         }
     </script>
@@ -610,14 +675,16 @@ def api_search():
         conn.row_factory = sqlite3.Row
         # 1. Exact Barcode Match first
         rows = conn.execute(
-            "SELECT * FROM products WHERE barcode = ?", (q,)
+            "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag FROM products WHERE barcode = ?",
+            (q,),
         ).fetchall()
 
-        # 2. If not found by exact barcode, search by Article Name or partial barcode
+        # 2. Fallback to partial barcode or Article Name match
         if not rows:
             like_q = f"%{q}%"
             rows = conn.execute(
-                "SELECT * FROM products WHERE name LIKE ? OR barcode LIKE ? LIMIT 15",
+                """SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag
+                   FROM products WHERE name LIKE ? OR barcode LIKE ? LIMIT 15""",
                 (like_q, like_q),
             ).fetchall()
 
@@ -705,16 +772,25 @@ def import_mapped():
 
     ext = os.path.splitext(filepath)[1].lower()
     now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
-    imported_count = 0
+    new_added = 0
+    existing_updated = 0
 
     try:
         with sqlite3.connect(DB_NAME) as conn:
+            # Fetch existing barcodes to accurately count New vs Updated
+            existing_barcodes = {
+                row[0]
+                for row in conn.execute("SELECT barcode FROM products").fetchall()
+            }
+
             for m in mappings:
                 sheet = m["sheet_name"]
                 b_col = m["barcode_col"]
                 n_col = m["name_col"]
-                p_col = m["price_col"]
-                c_col = m.get("category_col", "")
+                cx_col = m.get("price_cx_col", "")
+                emb_col = m.get("price_emb_col", "")
+                pc_col = m.get("price_pc_col", "")
+                bag_col = m.get("price_bag_col", "")
 
                 if ext == ".csv":
                     df = pd.read_csv(filepath)
@@ -731,39 +807,49 @@ def import_mapped():
                         if not pd.isna(row.get(n_col))
                         else ""
                     )
-                    price_val = row.get(p_col)
 
-                    if not barcode or not name or pd.isna(price_val):
+                    if not barcode:
                         continue
 
-                    if isinstance(price_val, (int, float)):
-                        price_str = f"{price_val:,.2f}"
-                    else:
-                        price_str = str(price_val).strip()
+                    p_cx = format_price(row.get(cx_col)) if cx_col else ""
+                    p_emb = format_price(row.get(emb_col)) if emb_col else ""
+                    p_pc = format_price(row.get(pc_col)) if pc_col else ""
+                    p_bag = format_price(row.get(bag_col)) if bag_col else ""
 
-                    category = ""
-                    if c_col and c_col in df.columns and not pd.isna(row.get(c_col)):
-                        category = str(row.get(c_col)).strip()
+                    # Skip row if all 4 prices are empty and name is empty
+                    if not any([p_cx, p_emb, p_pc, p_bag]) and not name:
+                        continue
+
+                    if barcode in existing_barcodes:
+                        existing_updated += 1
+                    else:
+                        new_added += 1
+                        existing_barcodes.add(barcode)
 
                     records_to_upsert.append(
-                        (barcode, name, price_str, category, sheet, now_str)
+                        (barcode, name, p_cx, p_emb, p_pc, p_bag, now_str)
                     )
 
+                # SMART MERGE UPSERT:
+                # 1. Inserts new article codes.
+                # 2. If article code already exists, updates the name and overwrites
+                #    any of the 4 prices that have a new non-empty value in the Excel,
+                #    while keeping existing prices if a column was left blank/unmapped.
                 conn.executemany(
                     """
-                    INSERT INTO products (barcode, name, price, category, source_tab, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO products (barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(barcode) DO UPDATE SET
-                        name=excluded.name,
-                        price=excluded.price,
-                        category=excluded.category,
-                        source_tab=excluded.source_tab,
-                        updated_at=excluded.updated_at
-                """,
+                        name = CASE WHEN excluded.name != '' THEN excluded.name ELSE products.name END,
+                        price_cx = CASE WHEN excluded.price_cx != '' THEN excluded.price_cx ELSE products.price_cx END,
+                        price_emb = CASE WHEN excluded.price_emb != '' THEN excluded.price_emb ELSE products.price_emb END,
+                        price_pc_kgm = CASE WHEN excluded.price_pc_kgm != '' THEN excluded.price_pc_kgm ELSE products.price_pc_kgm END,
+                        price_bag = CASE WHEN excluded.price_bag != '' THEN excluded.price_bag ELSE products.price_bag END,
+                        updated_at = excluded.updated_at
+                    """,
                     records_to_upsert,
                 )
 
-                imported_count += len(records_to_upsert)
             conn.commit()
 
             total_products = conn.execute(
@@ -777,7 +863,8 @@ def import_mapped():
 
         return jsonify({
             "success": True,
-            "imported_count": imported_count,
+            "new_added": new_added,
+            "existing_updated": existing_updated,
             "total_products": total_products,
         })
     except Exception as e:

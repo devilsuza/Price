@@ -2,7 +2,7 @@ import os
 import uuid
 import sqlite3
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 import pandas as pd
 
 app = Flask(__name__)
@@ -25,7 +25,6 @@ def init_db():
                 updated_at TEXT
             )
         """)
-        # Auto-migrate if older table structure exists
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()
         ]
@@ -62,7 +61,55 @@ def format_price(val):
     return s
 
 
-# --- HTML TEMPLATE (LOGIN + SCANNER + 4-PRICE MANAGER PORTAL) ---
+# --- SERVICE WORKER FOR OFFLINE PAGE CACHING ---
+SERVICE_WORKER_JS = """
+const CACHE_NAME = 'store-price-portal-v2';
+const ASSETS_TO_CACHE = [
+    '/',
+    'https://cdn.tailwindcss.com',
+    'https://unpkg.com/html5-qrcode'
+];
+
+self.addEventListener('install', (event) => {
+    self.skipWaiting();
+    event.waitUntil(
+        caches.open(CACHE_NAME).then((cache) => {
+            return cache.addAll(ASSETS_TO_CACHE).catch(() => {});
+        })
+    );
+});
+
+self.addEventListener('activate', (event) => {
+    event.waitUntil(
+        caches.keys().then((keys) =>
+            Promise.all(keys.map((k) => k !== CACHE_NAME && caches.delete(k)))
+        )
+    );
+    self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+    if (event.request.method !== 'GET') return;
+    const url = new URL(event.request.url);
+
+    // Do not intercept API calls in Service Worker (handled by IndexedDB logic)
+    if (url.pathname.startsWith('/api/')) return;
+
+    // Network-first for HTML/Assets, fallback to Offline Cache if internet is off
+    event.respondWith(
+        fetch(event.request)
+            .then((response) => {
+                const cloned = response.clone();
+                caches.open(CACHE_NAME).then((cache) => cache.put(event.request, cloned));
+                return response;
+            })
+            .catch(() => caches.match(event.request))
+    );
+});
+"""
+
+
+# --- HTML TEMPLATE (OFFLINE-FIRST + LOGIN + SCANNER + 4-PRICE MANAGER PORTAL) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -99,10 +146,20 @@ HTML_TEMPLATE = """
     <!-- ================= TOP NAVIGATION ================= -->
     <nav class="bg-indigo-700 text-white shadow-lg">
         <div class="max-w-5xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
-            <div class="flex items-center space-x-2">
+            <div class="flex items-center flex-wrap gap-2">
                 <span class="text-xl font-bold tracking-wide">🏪 Store Price Portal</span>
                 <span id="role-badge" class="text-xs bg-indigo-900 text-indigo-200 px-2.5 py-0.5 rounded-full font-semibold hidden"></span>
+                
+                <!-- Online / Offline Sync Status Badge -->
+                <div class="flex items-center space-x-1 bg-indigo-800/90 px-3 py-1 rounded-full border border-indigo-500 text-xs font-semibold">
+                    <span id="net-status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block"></span>
+                    <span id="net-status-text">Checking...</span>
+                    <button onclick="syncDatabaseInBackground(true)" id="btn-manual-sync" title="Sync Database Now" class="ml-1.5 text-indigo-200 hover:text-white">
+                        🔄
+                    </button>
+                </div>
             </div>
+
             <div class="flex items-center space-x-2">
                 <button onclick="switchMode('scanner')" id="btn-scanner" class="px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow">
                     🔍 Scanner
@@ -117,12 +174,23 @@ HTML_TEMPLATE = """
         </div>
     </nav>
 
-    <div class="max-w-4xl mx-auto p-4 mt-4">
+    <div class="max-w-4xl mx-auto p-4 mt-2">
+
+        <!-- Offline Mode Banner (Shows automatically when Internet is Off) -->
+        <div id="offline-banner" class="hidden mb-4 bg-amber-50 border-2 border-amber-400 text-amber-900 px-4 py-3 rounded-xl flex items-center justify-between text-sm font-semibold shadow-sm">
+            <div>
+                ⚡ <strong>Offline Mode Active:</strong> Internet band hai, par aap barcode scan kar sakte hain! Data local memory se aa raha hai.
+            </div>
+            <span id="offline-count-label" class="text-xs bg-amber-200 text-amber-900 px-2.5 py-1 rounded-lg font-bold whitespace-nowrap ml-2"></span>
+        </div>
 
         <!-- ================= EMPLOYEE SCANNER VIEW ================= -->
         <div id="view-scanner" class="space-y-6">
             <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200">
-                <h2 class="text-lg font-bold text-slate-700 mb-3">Scan Article Barcode or Search Name</h2>
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-bold text-slate-700">Scan Article Barcode or Search Name</h2>
+                    <span id="last-sync-time" class="text-[11px] text-slate-400 font-medium"></span>
+                </div>
                 
                 <!-- Search Input with Inline Small Scanner Icon inside the Box -->
                 <div class="flex flex-col sm:flex-row gap-3">
@@ -217,7 +285,188 @@ HTML_TEMPLATE = """
         let html5QrCode = null;
         let cameraActive = false;
 
-        // --- SUPERMARKET BEEP SOUND ---
+        // =========================================================================
+        // 1. OFFLINE INDEXEDDB ENGINE & AUTOMATIC BACKGROUND SYNC
+        // =========================================================================
+        const IDB_NAME = "StorePriceOfflineDB";
+        const IDB_VERSION = 1;
+        const STORE_NAME = "products";
+        let dbPromise = null;
+        let localItemCount = 0;
+        let isSyncing = false;
+
+        // Register Service Worker so page works even if refreshed offline
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW Error:', err));
+            });
+        }
+
+        function openLocalDB() {
+            if (dbPromise) return dbPromise;
+            dbPromise = new Promise((resolve, reject) => {
+                const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME, { keyPath: "barcode" });
+                    }
+                };
+                request.onsuccess = (e) => resolve(e.target.result);
+                request.onerror = (e) => reject(e.target.error);
+            });
+            return dbPromise;
+        }
+
+        // Save full product list into IndexedDB
+        async function saveAllToLocalDB(items) {
+            const db = await openLocalDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(STORE_NAME, "readwrite");
+                const store = tx.objectStore(STORE_NAME);
+                store.clear();
+                for (const item of items) {
+                    store.put(item);
+                }
+                tx.oncomplete = () => {
+                    localItemCount = items.length;
+                    const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    localStorage.setItem("last_sync_time", nowStr);
+                    localStorage.setItem("local_item_count", String(items.length));
+                    resolve(items.length);
+                };
+                tx.onerror = (e) => reject(e.target.error);
+            });
+        }
+
+        // Search inside Local IndexedDB (Works 100% Offline)
+        async function searchInLocalDB(query) {
+            const db = await openLocalDB();
+            const cleanQ = query.trim();
+            const lowerQ = cleanQ.toLowerCase();
+
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(STORE_NAME, "readonly");
+                const store = tx.objectStore(STORE_NAME);
+
+                // 1. Check Exact Barcode Match First (Instant O(1) lookup)
+                const exactReq = store.get(cleanQ);
+                exactReq.onsuccess = () => {
+                    if (exactReq.result) {
+                        resolve([exactReq.result]);
+                    } else {
+                        // 2. Fallback: Search partial barcode or Article Name
+                        const matches = [];
+                        const cursorReq = store.openCursor();
+                        cursorReq.onsuccess = (e) => {
+                            const cursor = e.target.result;
+                            if (cursor && matches.length < 15) {
+                                const item = cursor.value;
+                                const bMatch = item.barcode && item.barcode.toLowerCase().includes(lowerQ);
+                                const nMatch = item.name && item.name.toLowerCase().includes(lowerQ);
+                                if (bMatch || nMatch) {
+                                    matches.push(item);
+                                }
+                                cursor.continue();
+                            } else {
+                                resolve(matches);
+                            }
+                        };
+                        cursorReq.onerror = () => resolve([]);
+                    }
+                };
+                exactReq.onerror = () => resolve([]);
+            });
+        }
+
+        // Update Online / Offline UI Status Indicator
+        function updateNetworkUI(syncingState = false) {
+            const dot = document.getElementById('net-status-dot');
+            const text = document.getElementById('net-status-text');
+            const banner = document.getElementById('offline-banner');
+            const offlineCountLbl = document.getElementById('offline-count-label');
+            const lastSyncEl = document.getElementById('last-sync-time');
+
+            const savedCount = localStorage.getItem("local_item_count") || localItemCount || 0;
+            const savedTime = localStorage.getItem("last_sync_time") || "";
+
+            if (savedTime) {
+                lastSyncEl.innerText = `Local DB Synced at ${savedTime} (${savedCount} articles)`;
+            }
+
+            if (syncingState) {
+                dot.className = "w-2.5 h-2.5 rounded-full bg-blue-400 animate-ping inline-block";
+                text.innerText = "Syncing DB...";
+                return;
+            }
+
+            if (navigator.onLine) {
+                dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block";
+                text.innerText = `Online (${savedCount} Offline Ready)`;
+                banner.classList.add('hidden');
+            } else {
+                dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 inline-block";
+                text.innerText = `Offline Mode (${savedCount} items)`;
+                banner.classList.remove('hidden');
+                offlineCountLbl.innerText = `${savedCount} Articles Ready`;
+            }
+        }
+
+        // Automatic Background Sync Function
+        async function syncDatabaseInBackground(showAlert = false) {
+            if (!navigator.onLine || isSyncing) {
+                updateNetworkUI();
+                if (showAlert && !navigator.onLine) {
+                    alert("⚡ Aap abhi Offline hain! Internet connect hone par automatic sync ho jayega.");
+                }
+                return;
+            }
+
+            isSyncing = true;
+            updateNetworkUI(true);
+
+            try {
+                const res = await fetch("/api/sync-all", { cache: "no-store" });
+                const data = await res.json();
+                if (data.success && Array.isArray(data.items)) {
+                    await saveAllToLocalDB(data.items);
+                    document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.items.length}`;
+                    if (showAlert) {
+                        alert(`✅ Sync Complete! ${data.items.length} articles saved for Offline Mode.`);
+                    }
+                }
+            } catch (err) {
+                console.log("Background sync skipped (server unreachable):", err);
+            } finally {
+                isSyncing = false;
+                updateNetworkUI(false);
+            }
+        }
+
+        // Listen for Internet Disconnect / Reconnect Events Automatically
+        window.addEventListener('online', () => {
+            updateNetworkUI();
+            syncDatabaseInBackground(false); // Auto-sync immediately when internet returns!
+        });
+
+        window.addEventListener('offline', () => {
+            updateNetworkUI();
+        });
+
+        // Initial load: open local DB & sync in background
+        window.addEventListener('DOMContentLoaded', () => {
+            updateNetworkUI();
+            syncDatabaseInBackground(false);
+            // Also auto-sync every 10 minutes in background when online
+            setInterval(() => {
+                if (navigator.onLine) syncDatabaseInBackground(false);
+            }, 10 * 60 * 1000);
+        });
+
+
+        // =========================================================================
+        // 2. SUPERMARKET BEEP SOUND & LOGIN SYSTEM
+        // =========================================================================
         function playBeep() {
             try {
                 const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -239,7 +488,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // --- LOGIN & ROLE MANAGEMENT ---
         document.getElementById('login-pin').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') handleLogin();
         });
@@ -315,7 +563,9 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Listen for Enter key from USB Barcode Scanner or keyboard
+        // =========================================================================
+        // 3. HYBRID ONLINE + OFFLINE ARTICLE SEARCH & 4-PRICE DISPLAY
+        // =========================================================================
         document.getElementById('scan-input').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 playBeep();
@@ -323,7 +573,6 @@ HTML_TEMPLATE = """
             }
         });
 
-        // Helper to render each of the 4 price boxes cleanly
         function renderPriceBox(label, subLabel, value, colorClass) {
             const hasPrice = value && value.trim() !== "";
             return `
@@ -337,7 +586,47 @@ HTML_TEMPLATE = """
             `;
         }
 
-        // Search Article in Background and Show Only Code, Name & 4 Prices
+        function displaySearchResults(items, query, sourceLabel) {
+            const resultBox = document.getElementById('price-result');
+            resultBox.classList.remove('hidden');
+
+            if (!items || items.length === 0) {
+                resultBox.innerHTML = `
+                    <div class="bg-red-50 border-2 border-red-300 p-6 rounded-2xl text-center">
+                        <p class="text-2xl font-bold text-red-600">❌ Article Not Found</p>
+                        <p class="text-slate-600 mt-1">No record found for: <strong>${query}</strong> (${sourceLabel})</p>
+                    </div>`;
+                return;
+            }
+
+            resultBox.innerHTML = items.map(item => `
+                <div class="bg-white border-2 border-indigo-500 p-6 rounded-2xl shadow-lg space-y-5">
+                    <!-- Article Code & Article Name Header -->
+                    <div class="border-b border-slate-200 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs font-extrabold uppercase tracking-wider bg-indigo-100 text-indigo-800 px-3 py-1 rounded-lg">
+                                    Article Code: ${item.barcode}
+                                </span>
+                                <span class="text-[11px] font-semibold px-2.5 py-0.5 rounded-md ${sourceLabel.includes('Offline') ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}">
+                                    ${sourceLabel}
+                                </span>
+                            </div>
+                            <h3 class="text-2xl sm:text-3xl font-black text-slate-900 mt-2">${item.name}</h3>
+                        </div>
+                    </div>
+
+                    <!-- 4 Price Types Grid -->
+                    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
+                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
+                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
+                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
+                    </div>
+                </div>
+            `).join('');
+        }
+
         async function searchArticle(overrideQuery = null) {
             const inputEl = document.getElementById('scan-input');
             const query = (overrideQuery !== null ? overrideQuery : inputEl.value).trim();
@@ -345,48 +634,42 @@ HTML_TEMPLATE = """
 
             const resultBox = document.getElementById('price-result');
             resultBox.classList.remove('hidden');
+
+            // 1. IF OFFLINE -> Fetch Immediately from Local IndexedDB
+            if (!navigator.onLine) {
+                const localItems = await searchInLocalDB(query);
+                displaySearchResults(localItems, query, "⚡ Offline Local DB");
+                inputEl.select();
+                return;
+            }
+
+            // 2. IF ONLINE -> Try Server first (with 2.5s timeout), fallback to Local DB if connection drops
             resultBox.innerHTML = `<div class="bg-white p-6 rounded-2xl shadow text-center text-slate-500 font-medium">⏳ Fetching price details...</div>`;
 
             try {
-                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`, {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+
                 const data = await res.json();
-
-                if (!data.found || data.items.length === 0) {
-                    resultBox.innerHTML = `
-                        <div class="bg-red-50 border-2 border-red-300 p-6 rounded-2xl text-center">
-                            <p class="text-2xl font-bold text-red-600">❌ Article Not Found</p>
-                            <p class="text-slate-600 mt-1">No record found for: <strong>${query}</strong></p>
-                        </div>`;
-                } else {
-                    resultBox.innerHTML = data.items.map(item => `
-                        <div class="bg-white border-2 border-indigo-500 p-6 rounded-2xl shadow-lg space-y-5">
-                            <!-- Article Code & Article Name Header -->
-                            <div class="border-b border-slate-200 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                                <div>
-                                    <span class="text-xs font-extrabold uppercase tracking-wider bg-indigo-100 text-indigo-800 px-3 py-1 rounded-lg">
-                                        Article Code: ${item.barcode}
-                                    </span>
-                                    <h3 class="text-2xl sm:text-3xl font-black text-slate-900 mt-2">${item.name}</h3>
-                                </div>
-                            </div>
-
-                            <!-- 4 Price Types Grid -->
-                            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                                ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
-                                ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
-                                ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
-                                ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
-                            </div>
-                        </div>
-                    `).join('');
-                }
+                displaySearchResults(data.items || [], query, "🟢 Online Live DB");
                 inputEl.select();
             } catch (err) {
-                resultBox.innerHTML = `<div class="bg-red-100 p-4 rounded-xl text-red-700">Error fetching price from database.</div>`;
+                // Network failed or timed out -> Automatic fallback to Local IndexedDB!
+                console.log("Server unreachable, using Offline Local DB fallback...");
+                const localItems = await searchInLocalDB(query);
+                displaySearchResults(localItems, query, "⚡ Offline Local DB");
+                inputEl.select();
             }
         }
 
-        // --- INLINE CAMERA BARCODE & QR SCANNER ---
+        // =========================================================================
+        // 4. INLINE CAMERA BARCODE & QR SCANNER
+        // =========================================================================
         function toggleCamera() {
             if (cameraActive) {
                 stopCamera();
@@ -431,8 +714,14 @@ HTML_TEMPLATE = """
             document.getElementById('reader-container').classList.add('hidden');
         }
 
-        // --- MANAGER EXCEL UPLOAD & COLUMN MAPPING ---
+        // =========================================================================
+        // 5. MANAGER EXCEL UPLOAD & COLUMN MAPPING
+        // =========================================================================
         async function uploadForPreview() {
+            if (!navigator.onLine) {
+                alert("❌ Excel upload karne ke liye internet connection chahiye.");
+                return;
+            }
             const fileInput = document.getElementById('excel-file');
             const statusEl = document.getElementById('upload-status');
             if (!fileInput.files.length) {
@@ -634,8 +923,11 @@ HTML_TEMPLATE = """
                 btn.innerText = "✅ Merge & Update Prices";
 
                 if (data.success) {
+                    // Immediately sync the newly updated database to local Offline IndexedDB!
+                    await syncDatabaseInBackground(false);
+
                     alert(
-                        `✅ Merge Complete!\n\n` +
+                        `✅ Merge & Offline Sync Complete!\n\n` +
                         `🆕 New Articles Added: ${data.new_added}\n` +
                         `🔄 Existing Articles Updated: ${data.existing_updated}\n` +
                         `📦 Total Articles in Database: ${data.total_products}`
@@ -665,6 +957,23 @@ def index():
     return render_template_string(HTML_TEMPLATE, total_products=total)
 
 
+@app.route("/sw.js")
+def service_worker():
+    return Response(SERVICE_WORKER_JS, mimetype="application/javascript")
+
+
+@app.route("/api/sync-all")
+def api_sync_all():
+    """Returns all products for browser Offline IndexedDB caching."""
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at FROM products"
+        ).fetchall()
+    items = [dict(r) for r in rows]
+    return jsonify({"success": True, "count": len(items), "items": items})
+
+
 @app.route("/api/search")
 def api_search():
     q = request.args.get("q", "").strip()
@@ -673,13 +982,11 @@ def api_search():
 
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
-        # 1. Exact Barcode Match first
         rows = conn.execute(
             "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag FROM products WHERE barcode = ?",
             (q,),
         ).fetchall()
 
-        # 2. Fallback to partial barcode or Article Name match
         if not rows:
             like_q = f"%{q}%"
             rows = conn.execute(
@@ -777,7 +1084,6 @@ def import_mapped():
 
     try:
         with sqlite3.connect(DB_NAME) as conn:
-            # Fetch existing barcodes to accurately count New vs Updated
             existing_barcodes = {
                 row[0]
                 for row in conn.execute("SELECT barcode FROM products").fetchall()
@@ -816,7 +1122,6 @@ def import_mapped():
                     p_pc = format_price(row.get(pc_col)) if pc_col else ""
                     p_bag = format_price(row.get(bag_col)) if bag_col else ""
 
-                    # Skip row if all 4 prices are empty and name is empty
                     if not any([p_cx, p_emb, p_pc, p_bag]) and not name:
                         continue
 
@@ -830,11 +1135,6 @@ def import_mapped():
                         (barcode, name, p_cx, p_emb, p_pc, p_bag, now_str)
                     )
 
-                # SMART MERGE UPSERT:
-                # 1. Inserts new article codes.
-                # 2. If article code already exists, updates the name and overwrites
-                #    any of the 4 prices that have a new non-empty value in the Excel,
-                #    while keeping existing prices if a column was left blank/unmapped.
                 conn.executemany(
                     """
                     INSERT INTO products (barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at)

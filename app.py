@@ -38,7 +38,6 @@ init_db()
 
 
 def clean_barcode(val):
-    """Cleans Excel float formatting (e.g., converts '89012345.0' to '89012345')."""
     if pd.isna(val):
         return ""
     s = str(val).strip()
@@ -48,7 +47,6 @@ def clean_barcode(val):
 
 
 def format_price(val):
-    """Formats price values cleanly from Excel cells."""
     if val is None or pd.isna(val):
         return ""
     if isinstance(val, (int, float)):
@@ -61,13 +59,34 @@ def format_price(val):
     return s
 
 
-# --- SERVICE WORKER FOR OFFLINE PAGE CACHING ---
+# --- PWA MANIFEST JSON ---
+MANIFEST_JSON = """
+{
+  "name": "Store Price Portal",
+  "short_name": "PricePortal",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f1f5f9",
+  "theme_color": "#4338ca",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3081/3081559.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
+"""
+
+
+# --- SERVICE WORKER FOR OFFLINE CACHING & PWA ---
 SERVICE_WORKER_JS = """
-const CACHE_NAME = 'store-price-portal-v2';
+const CACHE_NAME = 'store-price-portal-v3';
 const ASSETS_TO_CACHE = [
     '/',
     'https://cdn.tailwindcss.com',
-    'https://unpkg.com/html5-qrcode'
+    'https://unpkg.com/html5-qrcode',
+    'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'
 ];
 
 self.addEventListener('install', (event) => {
@@ -92,10 +111,8 @@ self.addEventListener('fetch', (event) => {
     if (event.request.method !== 'GET') return;
     const url = new URL(event.request.url);
 
-    // Do not intercept API calls in Service Worker (handled by IndexedDB logic)
     if (url.pathname.startsWith('/api/')) return;
 
-    // Network-first for HTML/Assets, fallback to Offline Cache if internet is off
     event.respondWith(
         fetch(event.request)
             .then((response) => {
@@ -109,7 +126,7 @@ self.addEventListener('fetch', (event) => {
 """
 
 
-# --- HTML TEMPLATE (OFFLINE-FIRST + LOGIN + SCANNER + 4-PRICE MANAGER PORTAL) ---
+# --- HTML TEMPLATE (PWA INSTALL + OFFLINE + LOGIN + SCANNER) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -117,6 +134,8 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Store Price Checker & Manager Portal</title>
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#4338ca">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/html5-qrcode"></script>
 </head>
@@ -129,7 +148,7 @@ HTML_TEMPLATE = """
                 🔐
             </div>
             <h2 class="text-xl font-extrabold text-slate-800">Store Portal Login</h2>
-            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee or Manager</p>
+            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee (123) or Manager (321)</p>
 
             <input type="password" id="login-pin" autofocus
                 placeholder="Enter Password"
@@ -161,6 +180,10 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="flex items-center space-x-2">
+                <!-- PWA Install Button (Hidden by default until browser triggers beforeinstallprompt) -->
+                <button id="btn-install-app" onclick="installPWA()" class="hidden px-3 py-1.5 rounded-lg text-sm font-bold bg-emerald-500 hover:bg-emerald-600 text-white shadow-md flex items-center gap-1">
+                    📱 Install App
+                </button>
                 <button onclick="switchMode('scanner')" id="btn-scanner" class="px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow">
                     🔍 Scanner
                 </button>
@@ -176,10 +199,10 @@ HTML_TEMPLATE = """
 
     <div class="max-w-4xl mx-auto p-4 mt-2">
 
-        <!-- Offline Mode Banner (Shows automatically when Internet is Off) -->
+        <!-- Offline Mode Banner -->
         <div id="offline-banner" class="hidden mb-4 bg-amber-50 border-2 border-amber-400 text-amber-900 px-4 py-3 rounded-xl flex items-center justify-between text-sm font-semibold shadow-sm">
             <div>
-                ⚡ <strong>Offline Mode Active:</strong> Internet band hai, par aap barcode scan kar sakte hain! Data local memory se aa raha hai.
+                ⚡ <strong>Offline Mode Active:</strong> Internet band hai, par scanning chalu hai! Data local memory se aa raha hai.
             </div>
             <span id="offline-count-label" class="text-xs bg-amber-200 text-amber-900 px-2.5 py-1 rounded-lg font-bold whitespace-nowrap ml-2"></span>
         </div>
@@ -278,7 +301,7 @@ HTML_TEMPLATE = """
     <script>
         // --- PASSWORDS ---
         const EMPLOYEE_PASS = "123";
-        const MANAGER_PASS = "2026";
+        const MANAGER_PASS = "321";
         let currentRole = null;
 
         let currentTempFile = null;
@@ -286,7 +309,30 @@ HTML_TEMPLATE = """
         let cameraActive = false;
 
         // =========================================================================
-        // 1. OFFLINE INDEXEDDB ENGINE & AUTOMATIC BACKGROUND SYNC
+        // PWA INSTALL PROMPT LOGIC
+        // =========================================================================
+        let deferredPrompt = null;
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            deferredPrompt = e;
+            document.getElementById('btn-install-app').classList.remove('hidden');
+        });
+
+        async function installPWA() {
+            if (!deferredPrompt) {
+                alert("App already installed or browser doesn't support direct installation. You can also use browser menu -> 'Add to Home screen'.");
+                return;
+            }
+            deferredPrompt.prompt();
+            const { outcome } = await deferredPrompt.userChoice;
+            if (outcome === 'accepted') {
+                document.getElementById('btn-install-app').classList.add('hidden');
+            }
+            deferredPrompt = null;
+        }
+
+        // =========================================================================
+        // OFFLINE INDEXEDDB ENGINE & AUTOMATIC BACKGROUND SYNC
         // =========================================================================
         const IDB_NAME = "StorePriceOfflineDB";
         const IDB_VERSION = 1;
@@ -295,7 +341,6 @@ HTML_TEMPLATE = """
         let localItemCount = 0;
         let isSyncing = false;
 
-        // Register Service Worker so page works even if refreshed offline
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW Error:', err));
@@ -318,7 +363,6 @@ HTML_TEMPLATE = """
             return dbPromise;
         }
 
-        // Save full product list into IndexedDB
         async function saveAllToLocalDB(items) {
             const db = await openLocalDB();
             return new Promise((resolve, reject) => {
@@ -339,23 +383,20 @@ HTML_TEMPLATE = """
             });
         }
 
-        // Search inside Local IndexedDB (Works 100% Offline)
         async function searchInLocalDB(query) {
             const db = await openLocalDB();
             const cleanQ = query.trim();
             const lowerQ = cleanQ.toLowerCase();
 
-            return new Promise((resolve, reject) => {
+            return new Promise((resolve) => {
                 const tx = db.transaction(STORE_NAME, "readonly");
                 const store = tx.objectStore(STORE_NAME);
 
-                // 1. Check Exact Barcode Match First (Instant O(1) lookup)
                 const exactReq = store.get(cleanQ);
                 exactReq.onsuccess = () => {
                     if (exactReq.result) {
                         resolve([exactReq.result]);
                     } else {
-                        // 2. Fallback: Search partial barcode or Article Name
                         const matches = [];
                         const cursorReq = store.openCursor();
                         cursorReq.onsuccess = (e) => {
@@ -379,7 +420,6 @@ HTML_TEMPLATE = """
             });
         }
 
-        // Update Online / Offline UI Status Indicator
         function updateNetworkUI(syncingState = false) {
             const dot = document.getElementById('net-status-dot');
             const text = document.getElementById('net-status-text');
@@ -412,7 +452,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Automatic Background Sync Function
         async function syncDatabaseInBackground(showAlert = false) {
             if (!navigator.onLine || isSyncing) {
                 updateNetworkUI();
@@ -436,28 +475,25 @@ HTML_TEMPLATE = """
                     }
                 }
             } catch (err) {
-                console.log("Background sync skipped (server unreachable):", err);
+                console.log("Background sync skipped:", err);
             } finally {
                 isSyncing = false;
                 updateNetworkUI(false);
             }
         }
 
-        // Listen for Internet Disconnect / Reconnect Events Automatically
         window.addEventListener('online', () => {
             updateNetworkUI();
-            syncDatabaseInBackground(false); // Auto-sync immediately when internet returns!
+            syncDatabaseInBackground(false);
         });
 
         window.addEventListener('offline', () => {
             updateNetworkUI();
         });
 
-        // Initial load: open local DB & sync in background
         window.addEventListener('DOMContentLoaded', () => {
             updateNetworkUI();
             syncDatabaseInBackground(false);
-            // Also auto-sync every 10 minutes in background when online
             setInterval(() => {
                 if (navigator.onLine) syncDatabaseInBackground(false);
             }, 10 * 60 * 1000);
@@ -465,7 +501,7 @@ HTML_TEMPLATE = """
 
 
         // =========================================================================
-        // 2. SUPERMARKET BEEP SOUND & LOGIN SYSTEM
+        // LOGIN & SCANNER LOGIC
         // =========================================================================
         function playBeep() {
             try {
@@ -483,9 +519,7 @@ HTML_TEMPLATE = """
 
                 osc.start();
                 osc.stop(ctx.currentTime + 0.14);
-            } catch (e) {
-                console.log("Audio beep error:", e);
-            }
+            } catch (e) {}
         }
 
         document.getElementById('login-pin').addEventListener('keypress', function(e) {
@@ -533,7 +567,7 @@ HTML_TEMPLATE = """
 
         function switchMode(mode) {
             if (mode === 'manager' && currentRole !== 'manager') {
-                const askPin = prompt("🔒 Enter Manager Password to access Upload section:");
+                const askPin = prompt("🔒 Enter Manager Password (321) to access Upload section:");
                 if (askPin === MANAGER_PASS) {
                     currentRole = 'manager';
                     updateRoleBadge("👔 Manager");
@@ -563,9 +597,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // =========================================================================
-        // 3. HYBRID ONLINE + OFFLINE ARTICLE SEARCH & 4-PRICE DISPLAY
-        // =========================================================================
         document.getElementById('scan-input').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 playBeep();
@@ -601,7 +632,6 @@ HTML_TEMPLATE = """
 
             resultBox.innerHTML = items.map(item => `
                 <div class="bg-white border-2 border-indigo-500 p-6 rounded-2xl shadow-lg space-y-5">
-                    <!-- Article Code & Article Name Header -->
                     <div class="border-b border-slate-200 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                         <div>
                             <div class="flex items-center gap-2">
@@ -616,12 +646,11 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
 
-                    <!-- 4 Price Types Grid -->
                     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
-                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
-                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
-                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
+                        ${renderPriceBox('Price of CX', 'Box / Caixa', item.price_cx, 'bg-emerald-50 border-emerald-400')}
+                        ${renderPriceBox('Price of EMB', 'Pack / Embalagem', item.price_emb, 'bg-blue-50 border-blue-400')}
+                        ${renderPriceBox('Price of PC or KGM', 'Unit / Kg', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
+                        ${renderPriceBox('Price of BAG', 'Bag / Saco', item.price_bag, 'bg-purple-50 border-purple-400')}
                     </div>
                 </div>
             `).join('');
@@ -635,7 +664,6 @@ HTML_TEMPLATE = """
             const resultBox = document.getElementById('price-result');
             resultBox.classList.remove('hidden');
 
-            // 1. IF OFFLINE -> Fetch Immediately from Local IndexedDB
             if (!navigator.onLine) {
                 const localItems = await searchInLocalDB(query);
                 displaySearchResults(localItems, query, "⚡ Offline Local DB");
@@ -643,7 +671,6 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            // 2. IF ONLINE -> Try Server first (with 2.5s timeout), fallback to Local DB if connection drops
             resultBox.innerHTML = `<div class="bg-white p-6 rounded-2xl shadow text-center text-slate-500 font-medium">⏳ Fetching price details...</div>`;
 
             try {
@@ -659,17 +686,12 @@ HTML_TEMPLATE = """
                 displaySearchResults(data.items || [], query, "🟢 Online Live DB");
                 inputEl.select();
             } catch (err) {
-                // Network failed or timed out -> Automatic fallback to Local IndexedDB!
-                console.log("Server unreachable, using Offline Local DB fallback...");
                 const localItems = await searchInLocalDB(query);
                 displaySearchResults(localItems, query, "⚡ Offline Local DB");
                 inputEl.select();
             }
         }
 
-        // =========================================================================
-        // 4. INLINE CAMERA BARCODE & QR SCANNER
-        // =========================================================================
         function toggleCamera() {
             if (cameraActive) {
                 stopCamera();
@@ -694,7 +716,7 @@ HTML_TEMPLATE = """
                     },
                     (errorMessage) => {}
                 ).catch(err => {
-                    alert("Camera open nahi ho paya. Please allow camera permission in browser.");
+                    alert("Camera open nahi ho paya. Please allow camera permission.");
                     stopCamera();
                 });
             }
@@ -714,9 +736,6 @@ HTML_TEMPLATE = """
             document.getElementById('reader-container').classList.add('hidden');
         }
 
-        // =========================================================================
-        // 5. MANAGER EXCEL UPLOAD & COLUMN MAPPING
-        // =========================================================================
         async function uploadForPreview() {
             if (!navigator.onLine) {
                 alert("❌ Excel upload karne ke liye internet connection chahiye.");
@@ -751,7 +770,7 @@ HTML_TEMPLATE = """
 
                 currentTempFile = data.temp_filename;
                 statusEl.className = "mt-3 text-sm font-medium text-emerald-600";
-                statusEl.innerText = `✅ Found ${data.tabs.length} tab(s). Select the columns below for each tab:`;
+                statusEl.innerText = `✅ Found ${data.tabs.length} tab(s). Select columns below:`;
 
                 renderTabMappings(data.tabs);
             } catch (err) {
@@ -800,7 +819,6 @@ HTML_TEMPLATE = """
                         </label>
                     </div>
 
-                    <!-- Article Code & Name Mapping -->
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                         <div>
                             <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Code / Barcode *</label>
@@ -816,35 +834,33 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
 
-                    <!-- 4 Price Columns Mapping -->
                     <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 bg-white p-4 rounded-xl border border-slate-200">
                         <div>
-                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price</label>
+                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price of CX</label>
                             <select class="col-price-cx w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(cxGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price</label>
+                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price of EMB</label>
                             <select class="col-price-emb w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(embGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price</label>
+                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price of PC or KGM</label>
                             <select class="col-price-pc w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(pcGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price</label>
+                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price of BAG</label>
                             <select class="col-price-bag w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(bagGuess, '-- None / Skip --')}
                             </select>
                         </div>
                     </div>
 
-                    <!-- Sample Preview Table -->
                     <div class="mt-4 overflow-x-auto">
                         <p class="text-xs font-semibold text-slate-500 mb-1">Sample Preview (First 2 Rows):</p>
                         <table class="w-full text-xs text-left bg-white border border-slate-200 rounded-lg">
@@ -883,11 +899,6 @@ HTML_TEMPLATE = """
                     return;
                 }
 
-                if (!priceCxCol && !priceEmbCol && !pricePcCol && !priceBagCol) {
-                    alert(`Please select at least one Price column (CX, EMB, PC/KGM, or BAG) for tab: "${sheetName}"`);
-                    return;
-                }
-
                 mappings.push({
                     sheet_name: sheetName,
                     barcode_col: barcodeCol,
@@ -923,14 +934,12 @@ HTML_TEMPLATE = """
                 btn.innerText = "✅ Merge & Update Prices";
 
                 if (data.success) {
-                    // Immediately sync the newly updated database to local Offline IndexedDB!
                     await syncDatabaseInBackground(false);
-
                     alert(
                         `✅ Merge & Offline Sync Complete!\n\n` +
-                        `🆕 New Articles Added: ${data.new_added}\n` +
-                        `🔄 Existing Articles Updated: ${data.existing_updated}\n` +
-                        `📦 Total Articles in Database: ${data.total_products}`
+                        `🆕 New Added: ${data.new_added}\n` +
+                        `🔄 Updated: ${data.existing_updated}\n` +
+                        `📦 Total in DB: ${data.total_products}`
                     );
                     document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.total_products}`;
                     document.getElementById('mapping-section').classList.add('hidden');
@@ -957,6 +966,11 @@ def index():
     return render_template_string(HTML_TEMPLATE, total_products=total)
 
 
+@app.route("/manifest.json")
+def manifest():
+    return Response(MANIFEST_JSON, mimetype="application/json")
+
+
 @app.route("/sw.js")
 def service_worker():
     return Response(SERVICE_WORKER_JS, mimetype="application/javascript")
@@ -964,7 +978,6 @@ def service_worker():
 
 @app.route("/api/sync-all")
 def api_sync_all():
-    """Returns all products for browser Offline IndexedDB caching."""
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -1131,9 +1144,16 @@ def import_mapped():
                         new_added += 1
                         existing_barcodes.add(barcode)
 
-                    records_to_upsert.append(
-                        (barcode, name, p_cx, p_emb, p_pc, p_bag, now_str)
+                    records_to_xsert = (
+                        barcode,
+                        name,
+                        p_cx,
+                        p_emb,
+                        p_pc,
+                        p_bag,
+                        now_str,
                     )
+                    records_to_upsert.append(records_to_xsert)
 
                 conn.executemany(
                     """

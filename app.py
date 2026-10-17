@@ -129,7 +129,7 @@ HTML_TEMPLATE = """
                 🔐
             </div>
             <h2 class="text-xl font-extrabold text-slate-800">Store Portal Login</h2>
-            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee (123) or Manager (321)</p>
+            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee or Manager</p>
 
             <input type="password" id="login-pin" autofocus
                 placeholder="Enter Password"
@@ -278,7 +278,7 @@ HTML_TEMPLATE = """
     <script>
         // --- PASSWORDS ---
         const EMPLOYEE_PASS = "123";
-        const MANAGER_PASS = "321";
+        const MANAGER_PASS = "2026";
         let currentRole = null;
 
         let currentTempFile = null;
@@ -533,7 +533,7 @@ HTML_TEMPLATE = """
 
         function switchMode(mode) {
             if (mode === 'manager' && currentRole !== 'manager') {
-                const askPin = prompt("🔒 Enter Manager Password (321) to access Upload section:");
+                const askPin = prompt("🔒 Enter Manager Password to access Upload section:");
                 if (askPin === MANAGER_PASS) {
                     currentRole = 'manager';
                     updateRoleBadge("👔 Manager");

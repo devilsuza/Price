@@ -372,10 +372,10 @@ HTML_TEMPLATE = """
 
                             <!-- 4 Price Types Grid -->
                             <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                                ${renderPriceBox('Price of CX', 'Box / Caixa', item.price_cx, 'bg-emerald-50 border-emerald-400')}
-                                ${renderPriceBox('Price of EMB', 'Pack / Embalagem', item.price_emb, 'bg-blue-50 border-blue-400')}
-                                ${renderPriceBox('Price of PC or KGM', 'Unit / Kg', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
-                                ${renderPriceBox('Price of BAG', 'Bag / Saco', item.price_bag, 'bg-purple-50 border-purple-400')}
+                                ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
+                                ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
+                                ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
+                                ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
                             </div>
                         </div>
                     `).join('');
@@ -530,25 +530,25 @@ HTML_TEMPLATE = """
                     <!-- 4 Price Columns Mapping -->
                     <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 bg-white p-4 rounded-xl border border-slate-200">
                         <div>
-                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price of CX</label>
+                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price</label>
                             <select class="col-price-cx w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(cxGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price of EMB</label>
+                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price</label>
                             <select class="col-price-emb w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(embGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price of PC or KGM</label>
+                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price</label>
                             <select class="col-price-pc w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(pcGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price of BAG</label>
+                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price</label>
                             <select class="col-price-bag w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(bagGuess, '-- None / Skip --')}
                             </select>

@@ -1,0 +1,26 @@
+FRESMART RENDER + EPSON PRINT SETUP
+===================================
+
+GITHUB
+1. Replace the repository app.py with the included app.py.
+2. Keep your existing store_prices.db. Do not replace live data unless intended.
+3. Ensure requirements.txt includes Flask, pandas, openpyxl, xlrd and gunicorn.
+4. Commit and push. Render will redeploy.
+
+RENDER
+1. Open Dashboard > your Web Service > Environment.
+2. Add environment variable:
+   Key: PRINT_BRIDGE_KEY
+   Value: create a long random secret, for example 40+ mixed characters.
+3. Save changes and redeploy.
+4. If SQLite data must survive redeploys, use your existing persistent disk/database setup.
+
+PRINTER PC
+1. Open print_bridge_config.json in Notepad.
+2. Replace YOUR-RENDER-SERVICE with your exact Render service hostname.
+3. Replace CHANGE-THIS... with exactly the same PRINT_BRIDGE_KEY value from Render.
+4. Run INSTALL_RENDER_PRINT_BRIDGE.bat as Administrator.
+5. Keep the extracted folder in the same permanent location.
+
+USE
+Scan an article in the Render portal and click an available price. The portal creates a secure print job. The printer PC checks Render every 3 seconds and prints it automatically.

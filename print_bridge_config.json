@@ -1,0 +1,4 @@
+{
+  "portal_url": "https://YOUR-RENDER-SERVICE.onrender.com",
+  "bridge_key": "CHANGE-THIS-TO-THE-SAME-SECRET-KEY-AS-RENDER"
+}

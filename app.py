@@ -81,7 +81,7 @@ MANIFEST_JSON = """
 
 # --- SERVICE WORKER FOR OFFLINE CACHING & PWA ---
 SERVICE_WORKER_JS = """
-const CACHE_NAME = 'store-price-portal-v3';
+const CACHE_NAME = 'store-price-portal-v4';
 const ASSETS_TO_CACHE = [
     '/',
     'https://cdn.tailwindcss.com',
@@ -126,7 +126,7 @@ self.addEventListener('fetch', (event) => {
 """
 
 
-# --- HTML TEMPLATE (PWA INSTALL + OFFLINE + LOGIN + SCANNER) ---
+# --- HTML TEMPLATE (WITH MANAGER EDITABLE PRODUCT TABLE) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -148,7 +148,7 @@ HTML_TEMPLATE = """
                 🔐
             </div>
             <h2 class="text-xl font-extrabold text-slate-800">Store Portal Login</h2>
-            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee or Manager </p>
+            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee or Manager</p>
 
             <input type="password" id="login-pin" autofocus
                 placeholder="Enter Password"
@@ -164,12 +164,11 @@ HTML_TEMPLATE = """
 
     <!-- ================= TOP NAVIGATION ================= -->
     <nav class="bg-indigo-700 text-white shadow-lg">
-        <div class="max-w-5xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
+        <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
             <div class="flex items-center flex-wrap gap-2">
                 <span class="text-xl font-bold tracking-wide">🏪 Store Price Portal</span>
                 <span id="role-badge" class="text-xs bg-indigo-900 text-indigo-200 px-2.5 py-0.5 rounded-full font-semibold hidden"></span>
                 
-                <!-- Online / Offline Sync Status Badge -->
                 <div class="flex items-center space-x-1 bg-indigo-800/90 px-3 py-1 rounded-full border border-indigo-500 text-xs font-semibold">
                     <span id="net-status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block"></span>
                     <span id="net-status-text">Checking...</span>
@@ -180,7 +179,6 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="flex items-center space-x-2">
-                <!-- PWA Install Button (Hidden by default until browser triggers beforeinstallprompt) -->
                 <button id="btn-install-app" onclick="installPWA()" class="hidden px-3 py-1.5 rounded-lg text-sm font-bold bg-emerald-500 hover:bg-emerald-600 text-white shadow-md flex items-center gap-1">
                     📱 Install App
                 </button>
@@ -188,7 +186,7 @@ HTML_TEMPLATE = """
                     🔍 Scanner
                 </button>
                 <button onclick="switchMode('manager')" id="btn-manager" class="px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600">
-                    ⚙️ Manager Upload
+                    ⚙️ Manager Panel
                 </button>
                 <button onclick="logoutPortal()" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-600 text-white shadow">
                     🔒 Logout
@@ -197,7 +195,7 @@ HTML_TEMPLATE = """
         </div>
     </nav>
 
-    <div class="max-w-4xl mx-auto p-4 mt-2">
+    <div class="max-w-5xl mx-auto p-4 mt-2">
 
         <!-- Offline Mode Banner -->
         <div id="offline-banner" class="hidden mb-4 bg-amber-50 border-2 border-amber-400 text-amber-900 px-4 py-3 rounded-xl flex items-center justify-between text-sm font-semibold shadow-sm">
@@ -215,14 +213,12 @@ HTML_TEMPLATE = """
                     <span id="last-sync-time" class="text-[11px] text-slate-400 font-medium"></span>
                 </div>
                 
-                <!-- Search Input with Inline Small Scanner Icon inside the Box -->
                 <div class="flex flex-col sm:flex-row gap-3">
                     <div class="relative flex-1">
                         <input type="text" id="scan-input"
                             placeholder="Scan barcode here or type article code / name..."
                             class="w-full pl-4 pr-14 py-3 text-lg border-2 border-indigo-300 rounded-xl focus:outline-none focus:border-indigo-600">
                         
-                        <!-- Small Inline Barcode/QR Scanner Button Inside Input -->
                         <button type="button" onclick="toggleCamera()" id="inline-scan-btn"
                             title="Open QR / Barcode Camera Scanner"
                             class="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg border border-indigo-200 transition flex items-center justify-center shadow-sm">
@@ -237,7 +233,6 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
 
-                <!-- Mobile/Web Camera Container -->
                 <div id="reader-container" class="hidden mt-4 bg-slate-900 p-3 rounded-2xl max-w-sm mx-auto text-center">
                     <div class="flex justify-between items-center text-white text-xs font-semibold mb-2 px-1">
                         <span>📷 Point camera at Barcode or QR Code</span>
@@ -247,11 +242,10 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Price Display Result Card -->
             <div id="price-result" class="hidden space-y-4"></div>
         </div>
 
-        <!-- ================= MANAGER UPLOAD VIEW ================= -->
+        <!-- ================= MANAGER UPLOAD & EDIT VIEW ================= -->
         <div id="view-manager" class="hidden space-y-6">
             
             <!-- Step 1: Upload Excel -->
@@ -259,7 +253,7 @@ HTML_TEMPLATE = """
                 <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
                     <div>
                         <h2 class="text-xl font-bold text-slate-800">1. Upload Daily Price Excel (Auto-Merge)</h2>
-                        <p class="text-sm text-slate-500">New articles will be added & existing article prices will be updated automatically</p>
+                        <p class="text-sm text-slate-500">New articles added & existing prices updated automatically</p>
                     </div>
                     <span class="bg-indigo-50 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-full border border-indigo-200" id="total-count-badge">
                         Total Articles in DB: {{ total_products }}
@@ -281,7 +275,7 @@ HTML_TEMPLATE = """
             <div id="mapping-section" class="hidden bg-white p-6 rounded-2xl shadow-md border border-slate-200 space-y-5">
                 <div>
                     <h2 class="text-xl font-bold text-slate-800">2. Select Columns for Each Tab</h2>
-                    <p class="text-sm text-slate-500">Map Barcode, Article Name, and the 4 Price columns (CX, EMB, PC/KGM, BAG) for each tab.</p>
+                    <p class="text-sm text-slate-500">Map Barcode, Article Name, and the 4 Price columns (CX, EMB, PC/KGM, BAG).</p>
                 </div>
 
                 <div id="tabs-container" class="space-y-6"></div>
@@ -294,12 +288,51 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- Step 3: Searchable Product List & Inline Editing Table -->
+            <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200 space-y-4">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                    <div>
+                        <h2 class="text-xl font-bold text-slate-800">3. Live Product Catalog & Manual Price Editor</h2>
+                        <p class="text-sm text-slate-500">Search any article and click inside any price box to edit and save instantly.</p>
+                    </div>
+                    <button onclick="loadManagerProductTable()" class="bg-slate-800 hover:bg-slate-900 text-white font-semibold px-4 py-2 rounded-xl text-sm shadow">
+                        🔄 Refresh Table
+                    </button>
+                </div>
+
+                <!-- Search Filter Bar -->
+                <div class="relative">
+                    <input type="text" id="manager-search-input" oninput="filterManagerTable()"
+                        placeholder="Type article code or name to filter table..."
+                        class="w-full pl-4 pr-10 py-2.5 border-2 border-slate-300 rounded-xl focus:outline-none focus:border-indigo-600 text-sm">
+                </div>
+
+                <!-- Product Table Container -->
+                <div class="overflow-x-auto border border-slate-200 rounded-xl max-h-[500px]">
+                    <table class="w-full text-xs text-left bg-white">
+                        <thead class="bg-slate-100 text-slate-700 sticky top-0 uppercase font-bold tracking-wider z-10">
+                            <tr>
+                                <th class="px-3 py-3 border-b">Article Code</th>
+                                <th class="px-3 py-3 border-b">Article Name</th>
+                                <th class="px-3 py-3 border-b text-center">CX</th>
+                                <th class="px-3 py-3 border-b text-center">EMB</th>
+                                <th class="px-3 py-3 border-b text-center">PC / KGM</th>
+                                <th class="px-3 py-3 border-b text-center">BAG</th>
+                                <th class="px-3 py-3 border-b text-center">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="manager-table-body" class="divide-y divide-slate-200">
+                            <tr><td colspan="7" class="text-center py-6 text-slate-400">Loading products... Click Refresh Table if empty.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
         </div>
 
     </div>
 
     <script>
-        // --- PASSWORDS ---
         const EMPLOYEE_PASS = "123";
         const MANAGER_PASS = "2026";
         let currentRole = null;
@@ -307,10 +340,9 @@ HTML_TEMPLATE = """
         let currentTempFile = null;
         let html5QrCode = null;
         let cameraActive = false;
+        let allManagerProducts = [];
 
-        // =========================================================================
-        // PWA INSTALL PROMPT LOGIC
-        // =========================================================================
+        // PWA Install Prompt
         let deferredPrompt = null;
         window.addEventListener('beforeinstallprompt', (e) => {
             e.preventDefault();
@@ -320,7 +352,7 @@ HTML_TEMPLATE = """
 
         async function installPWA() {
             if (!deferredPrompt) {
-                alert("App already installed or browser doesn't support direct installation. You can also use browser menu -> 'Add to Home screen'.");
+                alert("App already installed or browser doesn't support direct installation.");
                 return;
             }
             deferredPrompt.prompt();
@@ -331,9 +363,7 @@ HTML_TEMPLATE = """
             deferredPrompt = null;
         }
 
-        // =========================================================================
-        // OFFLINE INDEXEDDB ENGINE & AUTOMATIC BACKGROUND SYNC
-        // =========================================================================
+        // Offline IndexedDB Engine
         const IDB_NAME = "StorePriceOfflineDB";
         const IDB_VERSION = 1;
         const STORE_NAME = "products";
@@ -430,7 +460,7 @@ HTML_TEMPLATE = """
             const savedCount = localStorage.getItem("local_item_count") || localItemCount || 0;
             const savedTime = localStorage.getItem("last_sync_time") || "";
 
-            if (savedTime) {
+            if (savedTime && lastSyncEl) {
                 lastSyncEl.innerText = `Local DB Synced at ${savedTime} (${savedCount} articles)`;
             }
 
@@ -448,7 +478,7 @@ HTML_TEMPLATE = """
                 dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 inline-block";
                 text.innerText = `Offline Mode (${savedCount} items)`;
                 banner.classList.remove('hidden');
-                offlineCountLbl.innerText = `${savedCount} Articles Ready`;
+                if (offlineCountLbl) offlineCountLbl.innerText = `${savedCount} Articles Ready`;
             }
         }
 
@@ -500,9 +530,7 @@ HTML_TEMPLATE = """
         });
 
 
-        // =========================================================================
-        // LOGIN & SCANNER LOGIC
-        // =========================================================================
+        // Login & Scanner Logic
         function playBeep() {
             try {
                 const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -567,7 +595,7 @@ HTML_TEMPLATE = """
 
         function switchMode(mode) {
             if (mode === 'manager' && currentRole !== 'manager') {
-                const askPin = prompt("🔒 Enter Manager Password to access Upload section:");
+                const askPin = prompt("🔒 Enter Manager Password to access Manager Panel:");
                 if (askPin === MANAGER_PASS) {
                     currentRole = 'manager';
                     updateRoleBadge("👔 Manager");
@@ -594,6 +622,7 @@ HTML_TEMPLATE = """
                 btnManager.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow";
                 btnScanner.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600";
                 stopCamera();
+                loadManagerProductTable(); // Load table when entering manager mode
             }
         }
 
@@ -647,10 +676,10 @@ HTML_TEMPLATE = """
                     </div>
 
                     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                        ${renderPriceBox('Price of CX', 'Box / Caixa', item.price_cx, 'bg-emerald-50 border-emerald-400')}
-                        ${renderPriceBox('Price of EMB', 'Pack / Embalagem', item.price_emb, 'bg-blue-50 border-blue-400')}
-                        ${renderPriceBox('Price of PC or KGM', 'Unit / Kg', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
-                        ${renderPriceBox('Price of BAG', 'Bag / Saco', item.price_bag, 'bg-purple-50 border-purple-400')}
+                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
+                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
+                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
+                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
                     </div>
                 </div>
             `).join('');
@@ -736,6 +765,100 @@ HTML_TEMPLATE = """
             document.getElementById('reader-container').classList.add('hidden');
         }
 
+        // =========================================================================
+        // MANAGER EDITABLE PRODUCT TABLE LOGIC
+        // =========================================================================
+        async function loadManagerProductTable() {
+            const tbody = document.getElementById('manager-table-body');
+            tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">Loading products from database...</td></tr>`;
+
+            try {
+                const res = await fetch("/api/sync-all");
+                const data = await res.json();
+                if (data.success && Array.isArray(data.items)) {
+                    allManagerProducts = data.items;
+                    renderManagerTable(allManagerProducts);
+                } else {
+                    tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-red-500">Failed to load products.</td></tr>`;
+                }
+            } catch (err) {
+                tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-red-500">Network error loading products.</td></tr>`;
+            }
+        }
+
+        function renderManagerTable(items) {
+            const tbody = document.getElementById('manager-table-body');
+            if (items.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">No products found in database.</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = items.map(item => `
+                <tr class="hover:bg-slate-50 transition" id="row-${item.barcode}">
+                    <td class="px-3 py-2.5 font-bold text-slate-700">${item.barcode}</td>
+                    <td class="px-3 py-2.5 font-medium text-slate-900 max-w-xs truncate" title="${item.name}">${item.name}</td>
+                    <td class="px-2 py-2 text-center"><input type="text" id="cx-${item.barcode}" value="${item.price_cx || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
+                    <td class="px-2 py-2 text-center"><input type="text" id="emb-${item.barcode}" value="${item.price_emb || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
+                    <td class="px-2 py-2 text-center"><input type="text" id="pc-${item.barcode}" value="${item.price_pc_kgm || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
+                    <td class="px-2 py-2 text-center"><input type="text" id="bag-${item.barcode}" value="${item.price_bag || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
+                    <td class="px-2 py-2 text-center">
+                        <button onclick="saveInlineProduct('${item.barcode}')" class="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow">
+                            💾 Save
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function filterManagerTable() {
+            const query = document.getElementById('manager-search-input').value.toLowerCase().trim();
+            if (!query) {
+                renderManagerTable(allManagerProducts);
+                return;
+            }
+            const filtered = allManagerProducts.filter(item => 
+                (item.barcode && item.barcode.toLowerCase().includes(query)) || 
+                (item.name && item.name.toLowerCase().includes(query))
+            );
+            renderManagerTable(filtered);
+        }
+
+        async function saveInlineProduct(barcode) {
+            const price_cx = document.getElementById(`cx-${barcode}`).value.trim();
+            const price_emb = document.getElementById(`emb-${barcode}`).value.trim();
+            const price_pc_kgm = document.getElementById(`pc-${barcode}`).value.trim();
+            const price_bag = document.getElementById(`bag-${barcode}`).value.trim();
+
+            try {
+                const res = await fetch("/api/update-single", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ barcode, price_cx, price_emb, price_pc_kgm, price_bag })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    // Update local cache array
+                    const idx = allManagerProducts.findIndex(p => p.barcode === barcode);
+                    if (idx !== -1) {
+                        allManagerProducts[idx].price_cx = price_cx;
+                        allManagerProducts[idx].price_emb = price_emb;
+                        allManagerProducts[idx].price_pc_kgm = price_pc_kgm;
+                        allManagerProducts[idx].price_bag = price_bag;
+                    }
+                    await syncDatabaseInBackground(false); // Resync offline DB
+                    alert(`✅ Prices updated successfully for article: ${barcode}`);
+                } else {
+                    alert("❌ Error updating: " + data.error);
+                }
+            } catch (err) {
+                alert("❌ Failed to update price.");
+            }
+        }
+
+
+        // =========================================================================
+        // EXCEL UPLOAD MAPPING LOGIC
+        // =========================================================================
         async function uploadForPreview() {
             if (!navigator.onLine) {
                 alert("❌ Excel upload karne ke liye internet connection chahiye.");
@@ -836,25 +959,25 @@ HTML_TEMPLATE = """
 
                     <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 bg-white p-4 rounded-xl border border-slate-200">
                         <div>
-                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price of CX</label>
+                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price</label>
                             <select class="col-price-cx w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(cxGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price of EMB</label>
+                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price</label>
                             <select class="col-price-emb w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(embGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price of PC or KGM</label>
+                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price</label>
                             <select class="col-price-pc w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(pcGuess, '-- None / Skip --')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price of BAG</label>
+                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price</label>
                             <select class="col-price-bag w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
                                 ${makeOptions(bagGuess, '-- None / Skip --')}
                             </select>
@@ -935,6 +1058,7 @@ HTML_TEMPLATE = """
 
                 if (data.success) {
                     await syncDatabaseInBackground(false);
+                    loadManagerProductTable(); // Refresh table
                     alert(
                         `✅ Merge & Offline Sync Complete!\n\n` +
                         `🆕 New Added: ${data.new_added}\n` +
@@ -985,6 +1109,39 @@ def api_sync_all():
         ).fetchall()
     items = [dict(r) for r in rows]
     return jsonify({"success": True, "count": len(items), "items": items})
+
+
+@app.route("/api/update-single", methods=["POST"])
+def update_single():
+    data = request.get_json()
+    barcode = data.get("barcode")
+    if not barcode:
+        return jsonify({"success": False, "error": "Missing barcode"})
+
+    p_cx = data.get("price_cx", "").strip()
+    p_emb = data.get("price_emb", "").strip()
+    p_pc = data.get("price_pc_kgm", "").strip()
+    p_bag = data.get("price_bag", "").strip()
+    now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
+
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute(
+                """
+                UPDATE products SET
+                    price_cx = ?,
+                    price_emb = ?,
+                    price_pc_kgm = ?,
+                    price_bag = ?,
+                    updated_at = ?
+                WHERE barcode = ?
+            """,
+                (p_cx, p_emb, p_pc, p_bag, now_str, barcode),
+            )
+            conn.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 
 @app.route("/api/search")
@@ -1144,16 +1301,9 @@ def import_mapped():
                         new_added += 1
                         existing_barcodes.add(barcode)
 
-                    records_to_xsert = (
-                        barcode,
-                        name,
-                        p_cx,
-                        p_emb,
-                        p_pc,
-                        p_bag,
-                        now_str,
+                    records_to_upsert.append(
+                        (barcode, name, p_cx, p_emb, p_pc, p_bag, now_str)
                     )
-                    records_to_upsert.append(records_to_xsert)
 
                 conn.executemany(
                     """

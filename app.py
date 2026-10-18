@@ -215,7 +215,7 @@ HTML_TEMPLATE = """
                 
                 <div class="flex flex-col sm:flex-row gap-3">
                     <div class="relative flex-1">
-                        <input type="text" id="scan-input"
+                        <input type="text" id="scan-input" inputmode="none" autocomplete="off" autocapitalize="off"
                             placeholder="Scan barcode here or type article code / name..."
                             class="w-full pl-4 pr-14 py-3 text-lg border-2 border-indigo-300 rounded-xl focus:outline-none focus:border-indigo-600">
                         
@@ -615,7 +615,7 @@ HTML_TEMPLATE = """
                 managerView.classList.add('hidden');
                 btnScanner.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow";
                 btnManager.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600";
-                document.getElementById('scan-input').focus();
+                prepareScannerInput();
             } else {
                 scannerView.classList.add('hidden');
                 managerView.classList.remove('hidden');
@@ -625,6 +625,18 @@ HTML_TEMPLATE = """
                 loadManagerProductTable(); // Load table when entering manager mode
             }
         }
+
+        function prepareScannerInput() {
+            const el = document.getElementById('scan-input');
+            el.blur();
+            el.setAttribute('inputmode', 'none');
+        }
+        document.getElementById('scan-input').addEventListener('pointerdown', function() {
+            this.setAttribute('inputmode', 'text');
+        });
+        document.getElementById('scan-input').addEventListener('blur', function() {
+            this.setAttribute('inputmode', 'none');
+        });
 
         document.getElementById('scan-input').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
@@ -739,7 +751,10 @@ HTML_TEMPLATE = """
                     { fps: 12, qrbox: { width: 250, height: 150 } },
                     (decodedText) => {
                         playBeep();
-                        document.getElementById('scan-input').value = decodedText;
+                        const scanBox = document.getElementById('scan-input');
+                        scanBox.value = decodedText;
+                        scanBox.blur();
+                        scanBox.setAttribute('inputmode', 'none');
                         stopCamera();
                         searchArticle(decodedText);
                     },
@@ -1146,25 +1161,25 @@ def update_single():
 
 @app.route("/api/search")
 def api_search():
-    q = request.args.get("q", "").strip()
+    q = clean_barcode(request.args.get("q", ""))
     if not q:
         return jsonify({"found": False, "items": []})
-
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
+        resolved = conn.execute("SELECT article_code FROM ean_aliases WHERE ean_code = ?", (q,)).fetchone()
+        article_code = resolved[0] if resolved else q
         rows = conn.execute(
             "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag FROM products WHERE barcode = ?",
-            (q,),
+            (article_code,),
         ).fetchall()
-
         if not rows:
             like_q = f"%{q}%"
             rows = conn.execute(
-                """SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag
-                   FROM products WHERE name LIKE ? OR barcode LIKE ? LIMIT 15""",
-                (like_q, like_q),
+                """SELECT DISTINCT p.barcode, p.name, p.price_cx, p.price_emb, p.price_pc_kgm, p.price_bag
+                   FROM products p LEFT JOIN ean_aliases e ON e.article_code = p.barcode
+                   WHERE p.name LIKE ? OR p.barcode LIKE ? OR e.ean_code LIKE ? LIMIT 15""",
+                (like_q, like_q, like_q),
             ).fetchall()
-
     items = [dict(r) for r in rows]
     return jsonify({"found": len(items) > 0, "items": items})
 
@@ -1277,15 +1292,18 @@ def import_mapped():
 
                 records_to_upsert = []
                 for _, row in df.iterrows():
-                    barcode = clean_barcode(row.get(b_col))
+                    uploaded_id = clean_barcode(row.get(b_col))
+                    if not uploaded_id:
+                        continue
+                    alias_row = conn.execute(
+                        "SELECT article_code FROM ean_aliases WHERE ean_code = ?", (uploaded_id,)
+                    ).fetchone()
+                    barcode = alias_row[0] if alias_row else uploaded_id
                     name = (
                         str(row.get(n_col, "")).strip()
                         if not pd.isna(row.get(n_col))
                         else ""
                     )
-
-                    if not barcode:
-                        continue
 
                     p_cx = format_price(row.get(cx_col)) if cx_col else ""
                     p_emb = format_price(row.get(emb_col)) if emb_col else ""

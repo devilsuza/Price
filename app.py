@@ -31,6 +31,23 @@ def init_db():
         for col in ["price_cx", "price_emb", "price_pc_kgm", "price_bag", "updated_at"]:
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE products ADD COLUMN {col} TEXT DEFAULT ''")
+
+        # One article can have multiple EAN/barcodes. This table resolves every EAN
+        # back to the single master article stored in products.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ean_aliases (
+                ean_code TEXT PRIMARY KEY,
+                article_code TEXT NOT NULL,
+                created_at TEXT,
+                FOREIGN KEY(article_code) REFERENCES products(barcode) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ean_article ON ean_aliases(article_code)")
+        # Existing article codes must also work as searchable aliases.
+        conn.execute("""
+            INSERT OR IGNORE INTO ean_aliases(ean_code, article_code, created_at)
+            SELECT barcode, barcode, COALESCE(updated_at, '') FROM products
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS print_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,29 +276,30 @@ HTML_TEMPLATE = """
         <!-- ================= MANAGER UPLOAD & EDIT VIEW ================= -->
         <div id="view-manager" class="hidden space-y-6">
             
-            <!-- Step 1: Upload Excel -->
-            <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200">
-                <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
-                    <div>
-                        <h2 class="text-xl font-bold text-slate-800">1. Upload Daily Price Excel (Auto-Merge)</h2>
-                        <p class="text-sm text-slate-500">New articles added & existing prices updated automatically</p>
+            <!-- Step 1: Separate Master Merge and Daily Price Update -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <div class="bg-white p-6 rounded-2xl shadow-md border-2 border-indigo-200">
+                    <div class="mb-4">
+                        <h2 class="text-xl font-bold text-slate-800">1A. Master Sheet Upload & Merge</h2>
+                        <p class="text-sm text-slate-500 mt-1">New article/EAN add karega aur sirf uploaded non-empty details se existing master merge karega. Ek article ke multiple EAN supported hain.</p>
                     </div>
-                    <span class="bg-indigo-50 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-full border border-indigo-200" id="total-count-badge">
-                        Total Articles in DB: {{ total_products }}
-                    </span>
+                    <input type="file" id="master-excel-file" accept=".xlsx,.xls,.csv"
+                        class="block w-full text-sm text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 border border-slate-200 rounded-xl p-1.5">
+                    <button onclick="uploadForPreview('master')" class="mt-3 w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-xl shadow">📚 Read Master Sheet</button>
+                    <div id="master-upload-status" class="mt-3 text-sm font-medium hidden"></div>
                 </div>
-
-                <div class="flex flex-col sm:flex-row items-center gap-4">
-                    <input type="file" id="excel-file" accept=".xlsx,.xls,.csv"
-                        class="block w-full text-sm text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 border border-slate-200 rounded-xl p-1.5">
-                    <button onclick="uploadForPreview()" id="btn-upload-preview"
-                        class="w-full sm:w-auto whitespace-nowrap bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-xl shadow">
-                        Read Tabs & Columns
-                    </button>
+                <div class="bg-white p-6 rounded-2xl shadow-md border-2 border-amber-200">
+                    <div class="mb-4">
+                        <h2 class="text-xl font-bold text-slate-800">1B. Daily Price Update</h2>
+                        <p class="text-sm text-slate-500 mt-1">Manager daily file upload kare. Sirf file me diye hue non-empty prices update honge; baaki sab prices/details same rahenge.</p>
+                    </div>
+                    <input type="file" id="price-excel-file" accept=".xlsx,.xls,.csv"
+                        class="block w-full text-sm text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-amber-50 file:text-amber-800 border border-slate-200 rounded-xl p-1.5">
+                    <button onclick="uploadForPreview('price')" class="mt-3 w-full bg-amber-500 hover:bg-amber-600 text-white font-semibold px-6 py-2.5 rounded-xl shadow">💰 Read Daily Price File</button>
+                    <div id="price-upload-status" class="mt-3 text-sm font-medium hidden"></div>
                 </div>
-                <div id="upload-status" class="mt-3 text-sm font-medium hidden"></div>
             </div>
-
+            <div class="flex justify-end"><span class="bg-indigo-50 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-full border border-indigo-200" id="total-count-badge">Total Articles in DB: {{ total_products }}</span></div>
             <!-- Step 2: Dynamic Tab & Column Mapping -->
             <div id="mapping-section" class="hidden bg-white p-6 rounded-2xl shadow-md border border-slate-200 space-y-5">
                 <div>
@@ -349,6 +367,7 @@ HTML_TEMPLATE = """
         let currentRole = null;
 
         let currentTempFile = null;
+        let currentUploadMode = "master";
         let html5QrCode = null;
         let cameraActive = false;
         let allManagerProducts = [];
@@ -510,7 +529,7 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 if (data.success && Array.isArray(data.items)) {
                     await saveAllToLocalDB(data.items);
-                    document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.items.length}`;
+                    document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.product_count ?? data.items.length}`;
                     if (showAlert) {
                         alert(`✅ Sync Complete! ${data.items.length} articles saved for Offline Mode.`);
                     }
@@ -659,7 +678,7 @@ HTML_TEMPLATE = """
         function renderPriceBox(label, subLabel, value, colorClass, item, priceType) {
             const hasPrice = value && String(value).trim() !== "";
             const units = {cx:'CX', emb:'EMB', pc_kgm:'UN', bag:'BAG'};
-            const payload = encodeURIComponent(JSON.stringify({article_code:item.barcode,item_name:item.name,price:value,unit:units[priceType]||'UN'}));
+            const payload = encodeURIComponent(JSON.stringify({article_code:(item.article_code || item.barcode),item_name:item.name,price:value,unit:units[priceType]||'UN'}));
             return `<button ${hasPrice ? `onclick="queuePricePrint('${payload}')"` : 'disabled'} class="w-full ${hasPrice ? colorClass+' hover:scale-[1.02] cursor-pointer' : 'bg-slate-50 border-slate-200 opacity-60'} border-2 rounded-2xl p-4 text-center shadow-sm transition">
                 <span class="text-xs font-extrabold uppercase tracking-wider block text-slate-600">${label}</span>
                 <span class="text-[11px] text-slate-500 block mb-1">${subLabel} · ${units[priceType]||''}</span>
@@ -670,13 +689,34 @@ HTML_TEMPLATE = """
 
         async function queuePricePrint(encoded) {
             const ticket=JSON.parse(decodeURIComponent(encoded));
+
+            // Ask label quantity at the exact moment the user selects a price to print.
+            const qtyInput = prompt("How many price labels do you want to print? (1-100)", "1");
+            if (qtyInput === null) return; // User cancelled.
+            const copies = Number(qtyInput);
+            if (!Number.isInteger(copies) || copies < 1 || copies > 100) {
+                alert("Please enter a valid quantity from 1 to 100.");
+                return;
+            }
+            ticket.copies = copies;
+
             const status=document.getElementById('print-status');
             status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-amber-50 text-amber-800 border border-amber-300';
-            status.textContent='⏳ Sending to printer...';
-            const res=await fetch('/api/print-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ticket)});
-            const data=await res.json();
-            if(res.ok && data.success){status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-800 border border-emerald-300';status.textContent=`✅ Print job #${data.job_id} sent to EPSON printer.`;}
-            else {status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';status.textContent='❌ '+(data.error||'Print job failed');}
+            status.textContent=`⏳ Sending ${copies} label${copies > 1 ? 's' : ''} to printer...`;
+            try {
+                const res=await fetch('/api/print-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ticket)});
+                const data=await res.json();
+                if(res.ok && data.success){
+                    status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-800 border border-emerald-300';
+                    status.textContent=`✅ ${data.copies} label${data.copies > 1 ? 's' : ''} queued. Print job #${data.job_id} sent to EPSON printer.`;
+                } else {
+                    status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';
+                    status.textContent='❌ '+(data.error||'Print job failed');
+                }
+            } catch (error) {
+                status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';
+                status.textContent='❌ Unable to connect to the print service.';
+            }
         }
 
         function displaySearchResults(items, query, sourceLabel) {
@@ -698,7 +738,7 @@ HTML_TEMPLATE = """
                         <div>
                             <div class="flex items-center gap-2">
                                 <span class="text-xs font-extrabold uppercase tracking-wider bg-indigo-100 text-indigo-800 px-3 py-1 rounded-lg">
-                                    Article Code: ${item.barcode}
+                                    Article Code: ${item.article_code || item.barcode}
                                 </span>
                                 <span class="text-[11px] font-semibold px-2.5 py-0.5 rounded-md ${sourceLabel.includes('Offline') ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}">
                                     ${sourceLabel}
@@ -809,7 +849,7 @@ HTML_TEMPLATE = """
             tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">Loading products from database...</td></tr>`;
 
             try {
-                const res = await fetch("/api/sync-all");
+                const res = await fetch("/api/sync-all?canonical=1");
                 const data = await res.json();
                 if (data.success && Array.isArray(data.items)) {
                     allManagerProducts = data.items;
@@ -895,13 +935,14 @@ HTML_TEMPLATE = """
         // =========================================================================
         // EXCEL UPLOAD MAPPING LOGIC
         // =========================================================================
-        async function uploadForPreview() {
+        async function uploadForPreview(mode = "master") {
+            currentUploadMode = mode;
             if (!navigator.onLine) {
                 alert("❌ Excel upload karne ke liye internet connection chahiye.");
                 return;
             }
-            const fileInput = document.getElementById('excel-file');
-            const statusEl = document.getElementById('upload-status');
+            const fileInput = document.getElementById(mode === "master" ? 'master-excel-file' : 'price-excel-file');
+            const statusEl = document.getElementById(mode === "master" ? 'master-upload-status' : 'price-upload-status');
             if (!fileInput.files.length) {
                 alert("Please select an Excel file first.");
                 return;
@@ -946,13 +987,14 @@ HTML_TEMPLATE = """
             return "";
         }
 
-        function renderTabMappings(tabs) {
+        function renderTabMappings(tabs, mode) {
             const section = document.getElementById('mapping-section');
             const container = document.getElementById('tabs-container');
             section.classList.remove('hidden');
 
             container.innerHTML = tabs.map((tab) => {
-                const barcodeGuess = guessColumn(tab.columns, ['barcode', 'code', 'cod', 'sku', 'art', 'ean', 'id']);
+                const barcodeGuess = guessColumn(tab.columns, mode === "master" ? ['article code', 'article', 'artigo', 'sku', 'item code', 'code', 'cod'] : ['ean', 'barcode', 'code', 'cod', 'sku', 'art', 'id']);
+                const eanGuess = guessColumn(tab.columns, ['ean', 'barcode', 'gtin', 'upc']);
                 const nameGuess = guessColumn(tab.columns, ['name', 'desc', 'product', 'article', 'item', 'nome']);
                 const cxGuess = guessColumn(tab.columns, ['cx', 'caixa', 'box', 'carton']);
                 const embGuess = guessColumn(tab.columns, ['emb', 'pack', 'pct', 'fardo']);
@@ -980,13 +1022,19 @@ HTML_TEMPLATE = """
 
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                         <div>
-                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Code / Barcode *</label>
+                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">${mode === "master" ? "Master Article Code *" : "Article Code / Any EAN *"}</label>
                             <select class="col-barcode w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
                                 ${makeOptions(barcodeGuess, '-- Select Barcode Column --')}
                             </select>
                         </div>
+                        <div class="${mode === 'master' ? '' : 'hidden'}">
+                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">EAN / Barcode Column</label>
+                            <select class="col-ean w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
+                                ${makeOptions(eanGuess, '-- Optional EAN Column --')}
+                            </select>
+                        </div>
                         <div>
-                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Name *</label>
+                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Name ${mode === "master" ? "" : "(Optional)"}</label>
                             <select class="col-name w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
                                 ${makeOptions(nameGuess, '-- Select Name Column --')}
                             </select>
@@ -1048,13 +1096,14 @@ HTML_TEMPLATE = """
                 const sheetName = card.getAttribute('data-tab-name');
                 const barcodeCol = card.querySelector('.col-barcode').value;
                 const nameCol = card.querySelector('.col-name').value;
+                const eanCol = card.querySelector('.col-ean').value;
                 const priceCxCol = card.querySelector('.col-price-cx').value;
                 const priceEmbCol = card.querySelector('.col-price-emb').value;
                 const pricePcCol = card.querySelector('.col-price-pc').value;
                 const priceBagCol = card.querySelector('.col-price-bag').value;
 
-                if (!barcodeCol || !nameCol) {
-                    alert(`Please select Article Code and Article Name columns for tab: "${sheetName}"`);
+                if (!barcodeCol) {
+                    alert(`Please select ${currentUploadMode === "master" ? "Master Article Code" : "Article Code / EAN"} column for tab: "${sheetName}"`);
                     return;
                 }
 
@@ -1062,6 +1111,7 @@ HTML_TEMPLATE = """
                     sheet_name: sheetName,
                     barcode_col: barcodeCol,
                     name_col: nameCol,
+                    ean_col: eanCol,
                     price_cx_col: priceCxCol,
                     price_emb_col: priceEmbCol,
                     price_pc_col: pricePcCol,
@@ -1076,7 +1126,7 @@ HTML_TEMPLATE = """
 
             const btn = document.getElementById('btn-confirm-import');
             btn.disabled = true;
-            btn.innerText = "⏳ Merging New & Existing Prices...";
+            btn.innerText = currentUploadMode === "master" ? "⏳ Merging Master & EANs..." : "⏳ Updating Only Uploaded Prices...";
 
             try {
                 const res = await fetch("/api/import-mapped", {
@@ -1084,13 +1134,14 @@ HTML_TEMPLATE = """
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         temp_filename: currentTempFile,
-                        mappings: mappings
+                        mappings: mappings,
+                        import_mode: currentUploadMode
                     })
                 });
                 const data = await res.json();
 
                 btn.disabled = false;
-                btn.innerText = "✅ Merge & Update Prices";
+                btn.innerText = currentUploadMode === "master" ? "✅ Merge Master Data" : "✅ Update Daily Prices";
 
                 if (data.success) {
                     await syncDatabaseInBackground(false);
@@ -1099,6 +1150,8 @@ HTML_TEMPLATE = """
                         `✅ Merge & Offline Sync Complete!\n\n` +
                         `🆕 New Added: ${data.new_added}\n` +
                         `🔄 Updated: ${data.existing_updated}\n` +
+                        `🔗 EAN Linked: ${data.ean_linked || 0}\n` +
+                        `⏭️ Skipped/Not Found: ${data.skipped || 0}\n` +
                         `📦 Total in DB: ${data.total_products}`
                     );
                     document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.total_products}`;
@@ -1108,7 +1161,7 @@ HTML_TEMPLATE = """
                 }
             } catch (err) {
                 btn.disabled = false;
-                btn.innerText = "✅ Merge & Update Prices";
+                btn.innerText = currentUploadMode === "master" ? "✅ Merge Master Data" : "✅ Update Daily Prices";
                 alert("❌ Failed to merge data.");
             }
         }
@@ -1138,13 +1191,29 @@ def service_worker():
 
 @app.route("/api/sync-all")
 def api_sync_all():
+    canonical_only = request.args.get("canonical") == "1"
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at FROM products"
-        ).fetchall()
-    items = [dict(r) for r in rows]
-    return jsonify({"success": True, "count": len(items), "items": items})
+        product_count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        if canonical_only:
+            rows = conn.execute(
+                "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at FROM products"
+            ).fetchall()
+            items = [dict(r) for r in rows]
+        else:
+            rows = conn.execute("""
+                SELECT e.ean_code AS search_key, p.barcode, p.name, p.price_cx, p.price_emb,
+                       p.price_pc_kgm, p.price_bag, p.updated_at
+                FROM products p JOIN ean_aliases e ON e.article_code = p.barcode
+            """).fetchall()
+            items = []
+            for r in rows:
+                item = dict(r)
+                # IndexedDB uses barcode as key, so each EAN becomes an offline-search key.
+                item["article_code"] = item["barcode"]
+                item["barcode"] = item.pop("search_key")
+                items.append(item)
+    return jsonify({"success": True, "count": len(items), "product_count": product_count, "items": items})
 
 
 @app.route("/api/update-single", methods=["POST"])
@@ -1210,10 +1279,16 @@ def create_print_job():
     data=request.get_json(silent=True) or {}
     for key in ("article_code","item_name","price"):
         if not str(data.get(key,"")).strip(): return jsonify({"success":False,"error":f"Missing {key}"}),400
+    try:
+        copies = int(data.get("copies", 1))
+    except (TypeError, ValueError):
+        return jsonify({"success":False,"error":"Quantity must be a whole number"}),400
+    if copies < 1 or copies > 100:
+        return jsonify({"success":False,"error":"Quantity must be between 1 and 100"}),400
     with sqlite3.connect(DB_NAME) as conn:
-        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,1,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),datetime.now().isoformat(timespec='seconds')))
+        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,?,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),copies,datetime.now().isoformat(timespec='seconds')))
         conn.commit()
-    return jsonify({"success":True,"job_id":cur.lastrowid})
+    return jsonify({"success":True,"job_id":cur.lastrowid,"copies":copies})
 
 def _bridge_ok():
     key=os.environ.get("PRINT_BRIDGE_KEY","")
@@ -1302,118 +1377,120 @@ def preview_excel():
 
 @app.route("/api/import-mapped", methods=["POST"])
 def import_mapped():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     temp_filename = data.get("temp_filename")
     mappings = data.get("mappings", [])
-
+    import_mode = data.get("import_mode", "master")
+    if import_mode not in ("master", "price"):
+        return jsonify({"success": False, "error": "Invalid import mode"}), 400
     if not temp_filename or not mappings:
-        return jsonify(
-            {"success": False, "error": "Missing file or column mappings"}
-        )
+        return jsonify({"success": False, "error": "Missing file or column mappings"}), 400
 
+    # Prevent path traversal: browser may only reference a generated temp filename.
+    temp_filename = os.path.basename(temp_filename)
     filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
     if not os.path.exists(filepath):
-        return jsonify({
-            "success": False,
-            "error": "Temporary file expired. Please upload again.",
-        })
+        return jsonify({"success": False, "error": "Temporary file expired. Please upload again."}), 400
 
     ext = os.path.splitext(filepath)[1].lower()
     now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
-    new_added = 0
-    existing_updated = 0
+    new_added = existing_updated = ean_linked = skipped = 0
+
+    def split_eans(value):
+        """Supports one EAN, multiple rows, or comma/semicolon/pipe/newline separated EANs."""
+        raw = clean_barcode(value)
+        if not raw:
+            return []
+        import re
+        return [clean_barcode(x) for x in re.split(r"[,;|\n]+", raw) if clean_barcode(x)]
 
     try:
         with sqlite3.connect(DB_NAME) as conn:
-            existing_barcodes = {
-                row[0]
-                for row in conn.execute("SELECT barcode FROM products").fetchall()
-            }
-
+            conn.execute("PRAGMA foreign_keys = ON")
             for m in mappings:
                 sheet = m["sheet_name"]
-                b_col = m["barcode_col"]
-                n_col = m["name_col"]
+                code_col = m["barcode_col"]
+                ean_col = m.get("ean_col", "")
+                name_col = m.get("name_col", "")
                 cx_col = m.get("price_cx_col", "")
                 emb_col = m.get("price_emb_col", "")
                 pc_col = m.get("price_pc_col", "")
                 bag_col = m.get("price_bag_col", "")
-
-                if ext == ".csv":
-                    df = pd.read_csv(filepath)
-                else:
-                    df = pd.read_excel(filepath, sheet_name=sheet)
-
+                df = pd.read_csv(filepath, dtype=str) if ext == ".csv" else pd.read_excel(filepath, sheet_name=sheet, dtype=str)
                 df = df.dropna(how="all")
 
-                records_to_upsert = []
                 for _, row in df.iterrows():
-                    uploaded_id = clean_barcode(row.get(b_col))
-                    if not uploaded_id:
+                    uploaded_code = clean_barcode(row.get(code_col))
+                    if not uploaded_code:
+                        skipped += 1
                         continue
-                    alias_row = conn.execute(
-                        "SELECT article_code FROM ean_aliases WHERE ean_code = ?", (uploaded_id,)
-                    ).fetchone()
-                    barcode = alias_row[0] if alias_row else uploaded_id
-                    name = (
-                        str(row.get(n_col, "")).strip()
-                        if not pd.isna(row.get(n_col))
-                        else ""
-                    )
+                    name = clean_barcode(row.get(name_col)) if name_col else ""
+                    prices = {
+                        "price_cx": format_price(row.get(cx_col)) if cx_col else "",
+                        "price_emb": format_price(row.get(emb_col)) if emb_col else "",
+                        "price_pc_kgm": format_price(row.get(pc_col)) if pc_col else "",
+                        "price_bag": format_price(row.get(bag_col)) if bag_col else "",
+                    }
 
-                    p_cx = format_price(row.get(cx_col)) if cx_col else ""
-                    p_emb = format_price(row.get(emb_col)) if emb_col else ""
-                    p_pc = format_price(row.get(pc_col)) if pc_col else ""
-                    p_bag = format_price(row.get(bag_col)) if bag_col else ""
-
-                    if not any([p_cx, p_emb, p_pc, p_bag]) and not name:
-                        continue
-
-                    if barcode in existing_barcodes:
+                    if import_mode == "price":
+                        resolved = conn.execute("SELECT article_code FROM ean_aliases WHERE ean_code=?", (uploaded_code,)).fetchone()
+                        article_code = resolved[0] if resolved else uploaded_code
+                        exists = conn.execute("SELECT 1 FROM products WHERE barcode=?", (article_code,)).fetchone()
+                        if not exists:
+                            skipped += 1
+                            continue
+                        assignments, values = [], []
+                        for col, val in prices.items():
+                            if val != "":
+                                assignments.append(f"{col}=?")
+                                values.append(val)
+                        if not assignments:
+                            skipped += 1
+                            continue
+                        assignments.append("updated_at=?")
+                        values.extend([now_str, article_code])
+                        conn.execute(f"UPDATE products SET {', '.join(assignments)} WHERE barcode=?", values)
                         existing_updated += 1
-                    else:
-                        new_added += 1
-                        existing_barcodes.add(barcode)
+                        continue
 
-                    records_to_upsert.append(
-                        (barcode, name, p_cx, p_emb, p_pc, p_bag, now_str)
-                    )
+                    # MASTER MERGE: article code is canonical; blank uploaded fields never erase old data.
+                    article_code = uploaded_code
+                    existed = conn.execute("SELECT 1 FROM products WHERE barcode=?", (article_code,)).fetchone()
+                    stored_name = name if name else (article_code if not existed else "")
+                    conn.execute("""
+                        INSERT INTO products(barcode,name,price_cx,price_emb,price_pc_kgm,price_bag,updated_at)
+                        VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(barcode) DO UPDATE SET
+                          name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE products.name END,
+                          price_cx=CASE WHEN excluded.price_cx<>'' THEN excluded.price_cx ELSE products.price_cx END,
+                          price_emb=CASE WHEN excluded.price_emb<>'' THEN excluded.price_emb ELSE products.price_emb END,
+                          price_pc_kgm=CASE WHEN excluded.price_pc_kgm<>'' THEN excluded.price_pc_kgm ELSE products.price_pc_kgm END,
+                          price_bag=CASE WHEN excluded.price_bag<>'' THEN excluded.price_bag ELSE products.price_bag END,
+                          updated_at=excluded.updated_at
+                    """, (article_code, stored_name, prices["price_cx"], prices["price_emb"], prices["price_pc_kgm"], prices["price_bag"], now_str))
+                    existing_updated += int(bool(existed)); new_added += int(not existed)
 
-                conn.executemany(
-                    """
-                    INSERT INTO products (barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(barcode) DO UPDATE SET
-                        name = CASE WHEN excluded.name != '' THEN excluded.name ELSE products.name END,
-                        price_cx = CASE WHEN excluded.price_cx != '' THEN excluded.price_cx ELSE products.price_cx END,
-                        price_emb = CASE WHEN excluded.price_emb != '' THEN excluded.price_emb ELSE products.price_emb END,
-                        price_pc_kgm = CASE WHEN excluded.price_pc_kgm != '' THEN excluded.price_pc_kgm ELSE products.price_pc_kgm END,
-                        price_bag = CASE WHEN excluded.price_bag != '' THEN excluded.price_bag ELSE products.price_bag END,
-                        updated_at = excluded.updated_at
-                    """,
-                    records_to_upsert,
-                )
+                    aliases = [article_code]
+                    if ean_col:
+                        aliases.extend(split_eans(row.get(ean_col)))
+                    for ean in dict.fromkeys(a for a in aliases if a):
+                        # If an EAN was wrongly linked before, latest master upload intentionally corrects it.
+                        conn.execute("""
+                            INSERT INTO ean_aliases(ean_code,article_code,created_at) VALUES(?,?,?)
+                            ON CONFLICT(ean_code) DO UPDATE SET article_code=excluded.article_code
+                        """, (ean, article_code, now_str))
+                        ean_linked += 1
 
             conn.commit()
-
-            total_products = conn.execute(
-                "SELECT COUNT(*) FROM products"
-            ).fetchone()[0]
-
+            total_products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
         try:
             os.remove(filepath)
         except OSError:
             pass
-
-        return jsonify({
-            "success": True,
-            "new_added": new_added,
-            "existing_updated": existing_updated,
-            "total_products": total_products,
-        })
+        return jsonify({"success": True, "new_added": new_added, "existing_updated": existing_updated,
+                        "ean_linked": ean_linked, "skipped": skipped, "total_products": total_products})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
+        return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

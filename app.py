@@ -31,6 +31,16 @@ def init_db():
         for col in ["price_cx", "price_emb", "price_pc_kgm", "price_bag", "updated_at"]:
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE products ADD COLUMN {col} TEXT DEFAULT ''")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS print_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_code TEXT NOT NULL, item_name TEXT NOT NULL,
+                price TEXT NOT NULL, unit TEXT NOT NULL DEFAULT 'UN',
+                currency TEXT NOT NULL DEFAULT 'KZ', copies INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+                claimed_at TEXT, printed_at TEXT, error_message TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -81,7 +91,7 @@ MANIFEST_JSON = """
 
 # --- SERVICE WORKER FOR OFFLINE CACHING & PWA ---
 SERVICE_WORKER_JS = """
-const CACHE_NAME = 'store-price-portal-v4';
+const CACHE_NAME = 'store-price-portal-v7-print';
 const ASSETS_TO_CACHE = [
     '/',
     'https://cdn.tailwindcss.com',
@@ -215,7 +225,7 @@ HTML_TEMPLATE = """
                 
                 <div class="flex flex-col sm:flex-row gap-3">
                     <div class="relative flex-1">
-                        <input type="text" id="scan-input"
+                        <input type="text" id="scan-input" inputmode="none" autocomplete="off" autocapitalize="off"
                             placeholder="Scan barcode here or type article code / name..."
                             class="w-full pl-4 pr-14 py-3 text-lg border-2 border-indigo-300 rounded-xl focus:outline-none focus:border-indigo-600">
                         
@@ -243,6 +253,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div id="price-result" class="hidden space-y-4"></div>
+            <div id="print-status" class="hidden mt-3"></div>
         </div>
 
         <!-- ================= MANAGER UPLOAD & EDIT VIEW ================= -->
@@ -615,7 +626,7 @@ HTML_TEMPLATE = """
                 managerView.classList.add('hidden');
                 btnScanner.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow";
                 btnManager.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600";
-                document.getElementById('scan-input').focus();
+                prepareScannerInput();
             } else {
                 scannerView.classList.add('hidden');
                 managerView.classList.remove('hidden');
@@ -626,6 +637,18 @@ HTML_TEMPLATE = """
             }
         }
 
+        function prepareScannerInput() {
+            const el = document.getElementById('scan-input');
+            el.blur();
+            el.setAttribute('inputmode', 'none');
+        }
+        document.getElementById('scan-input').addEventListener('pointerdown', function() {
+            this.setAttribute('inputmode', 'text');
+        });
+        document.getElementById('scan-input').addEventListener('blur', function() {
+            this.setAttribute('inputmode', 'none');
+        });
+
         document.getElementById('scan-input').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 playBeep();
@@ -633,17 +656,27 @@ HTML_TEMPLATE = """
             }
         });
 
-        function renderPriceBox(label, subLabel, value, colorClass) {
-            const hasPrice = value && value.trim() !== "";
-            return `
-                <div class="${hasPrice ? colorClass : 'bg-slate-50 border-slate-200 opacity-60'} border-2 rounded-2xl p-4 text-center shadow-sm transition">
-                    <span class="text-xs font-extrabold uppercase tracking-wider block text-slate-600">${label}</span>
-                    <span class="text-[11px] text-slate-400 block mb-1">${subLabel}</span>
-                    <span class="${hasPrice ? 'text-2xl sm:text-3xl font-black text-slate-900' : 'text-xl font-bold text-slate-400'} block mt-1">
-                        ${hasPrice ? value : '--'}
-                    </span>
-                </div>
-            `;
+        function renderPriceBox(label, subLabel, value, colorClass, item, priceType) {
+            const hasPrice = value && String(value).trim() !== "";
+            const units = {cx:'CX', emb:'EMB', pc_kgm:'UN', bag:'BAG'};
+            const payload = encodeURIComponent(JSON.stringify({article_code:item.barcode,item_name:item.name,price:value,unit:units[priceType]||'UN'}));
+            return `<button ${hasPrice ? `onclick="queuePricePrint('${payload}')"` : 'disabled'} class="w-full ${hasPrice ? colorClass+' hover:scale-[1.02] cursor-pointer' : 'bg-slate-50 border-slate-200 opacity-60'} border-2 rounded-2xl p-4 text-center shadow-sm transition">
+                <span class="text-xs font-extrabold uppercase tracking-wider block text-slate-600">${label}</span>
+                <span class="text-[11px] text-slate-500 block mb-1">${subLabel} · ${units[priceType]||''}</span>
+                <span class="${hasPrice ? 'text-2xl sm:text-3xl font-black text-slate-900' : 'text-xl font-bold text-slate-400'} block mt-1">${hasPrice ? value : '--'}</span>
+                ${hasPrice ? '<span class="block mt-2 text-sm font-black text-indigo-700">🖨️ PRINT THIS PRICE</span>' : ''}
+            </button>`;
+        }
+
+        async function queuePricePrint(encoded) {
+            const ticket=JSON.parse(decodeURIComponent(encoded));
+            const status=document.getElementById('print-status');
+            status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-amber-50 text-amber-800 border border-amber-300';
+            status.textContent='⏳ Sending to printer...';
+            const res=await fetch('/api/print-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ticket)});
+            const data=await res.json();
+            if(res.ok && data.success){status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-800 border border-emerald-300';status.textContent=`✅ Print job #${data.job_id} sent to EPSON printer.`;}
+            else {status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';status.textContent='❌ '+(data.error||'Print job failed');}
         }
 
         function displaySearchResults(items, query, sourceLabel) {
@@ -676,10 +709,10 @@ HTML_TEMPLATE = """
                     </div>
 
                     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
-                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
-                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
-                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
+                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400', item, 'cx')}
+                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400', item, 'emb')}
+                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400', item, 'pc_kgm')}
+                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400', item, 'bag')}
                     </div>
                 </div>
             `).join('');
@@ -739,7 +772,10 @@ HTML_TEMPLATE = """
                     { fps: 12, qrbox: { width: 250, height: 150 } },
                     (decodedText) => {
                         playBeep();
-                        document.getElementById('scan-input').value = decodedText;
+                        const scanBox = document.getElementById('scan-input');
+                        scanBox.value = decodedText;
+                        scanBox.blur();
+                        scanBox.setAttribute('inputmode', 'none');
                         stopCamera();
                         searchArticle(decodedText);
                     },
@@ -1146,27 +1182,62 @@ def update_single():
 
 @app.route("/api/search")
 def api_search():
-    q = request.args.get("q", "").strip()
+    q = clean_barcode(request.args.get("q", ""))
     if not q:
         return jsonify({"found": False, "items": []})
-
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
+        resolved = conn.execute("SELECT article_code FROM ean_aliases WHERE ean_code = ?", (q,)).fetchone()
+        article_code = resolved[0] if resolved else q
         rows = conn.execute(
             "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag FROM products WHERE barcode = ?",
-            (q,),
+            (article_code,),
         ).fetchall()
-
         if not rows:
             like_q = f"%{q}%"
             rows = conn.execute(
-                """SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag
-                   FROM products WHERE name LIKE ? OR barcode LIKE ? LIMIT 15""",
-                (like_q, like_q),
+                """SELECT DISTINCT p.barcode, p.name, p.price_cx, p.price_emb, p.price_pc_kgm, p.price_bag
+                   FROM products p LEFT JOIN ean_aliases e ON e.article_code = p.barcode
+                   WHERE p.name LIKE ? OR p.barcode LIKE ? OR e.ean_code LIKE ? LIMIT 15""",
+                (like_q, like_q, like_q),
             ).fetchall()
-
     items = [dict(r) for r in rows]
     return jsonify({"found": len(items) > 0, "items": items})
+
+
+@app.route("/api/print-jobs", methods=["POST"])
+def create_print_job():
+    data=request.get_json(silent=True) or {}
+    for key in ("article_code","item_name","price"):
+        if not str(data.get(key,"")).strip(): return jsonify({"success":False,"error":f"Missing {key}"}),400
+    with sqlite3.connect(DB_NAME) as conn:
+        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,1,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),datetime.now().isoformat(timespec='seconds')))
+        conn.commit()
+    return jsonify({"success":True,"job_id":cur.lastrowid})
+
+def _bridge_ok():
+    key=os.environ.get("PRINT_BRIDGE_KEY","")
+    return bool(key) and request.headers.get("X-Print-Bridge-Key","")==key
+
+@app.route("/api/print-jobs/next")
+def next_print_job():
+    if not _bridge_ok(): return jsonify({"success":False,"error":"Unauthorized"}),401
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory=sqlite3.Row; conn.execute("BEGIN IMMEDIATE")
+        row=conn.execute("SELECT * FROM print_jobs WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        if not row: conn.commit(); return jsonify({"success":True,"job":None})
+        conn.execute("UPDATE print_jobs SET status='claimed',claimed_at=? WHERE id=?",(datetime.now().isoformat(timespec='seconds'),row['id'])); conn.commit()
+    return jsonify({"success":True,"job":dict(row)})
+
+@app.route("/api/print-jobs/<int:job_id>/complete",methods=["POST"])
+def complete_print_job(job_id):
+    if not _bridge_ok(): return jsonify({"success":False,"error":"Unauthorized"}),401
+    data=request.get_json(silent=True) or {}; ok=bool(data.get('success'))
+    with sqlite3.connect(DB_NAME) as conn:
+        if ok: conn.execute("UPDATE print_jobs SET status='printed',printed_at=?,error_message=NULL WHERE id=?",(datetime.now().isoformat(timespec='seconds'),job_id))
+        else: conn.execute("UPDATE print_jobs SET status='pending',error_message=? WHERE id=?",(str(data.get('error','Print failed'))[:500],job_id))
+        conn.commit()
+    return jsonify({"success":True})
 
 
 @app.route("/api/preview-excel", methods=["POST"])
@@ -1277,15 +1348,18 @@ def import_mapped():
 
                 records_to_upsert = []
                 for _, row in df.iterrows():
-                    barcode = clean_barcode(row.get(b_col))
+                    uploaded_id = clean_barcode(row.get(b_col))
+                    if not uploaded_id:
+                        continue
+                    alias_row = conn.execute(
+                        "SELECT article_code FROM ean_aliases WHERE ean_code = ?", (uploaded_id,)
+                    ).fetchone()
+                    barcode = alias_row[0] if alias_row else uploaded_id
                     name = (
                         str(row.get(n_col, "")).strip()
                         if not pd.isna(row.get(n_col))
                         else ""
                     )
-
-                    if not barcode:
-                        continue
 
                     p_cx = format_price(row.get(cx_col)) if cx_col else ""
                     p_emb = format_price(row.get(emb_col)) if emb_col else ""

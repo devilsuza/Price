@@ -689,34 +689,13 @@ HTML_TEMPLATE = """
 
         async function queuePricePrint(encoded) {
             const ticket=JSON.parse(decodeURIComponent(encoded));
-
-            // Ask label quantity at the exact moment the user selects a price to print.
-            const qtyInput = prompt("How many price labels do you want to print? (1-100)", "1");
-            if (qtyInput === null) return; // User cancelled.
-            const copies = Number(qtyInput);
-            if (!Number.isInteger(copies) || copies < 1 || copies > 100) {
-                alert("Please enter a valid quantity from 1 to 100.");
-                return;
-            }
-            ticket.copies = copies;
-
             const status=document.getElementById('print-status');
             status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-amber-50 text-amber-800 border border-amber-300';
-            status.textContent=`⏳ Sending ${copies} label${copies > 1 ? 's' : ''} to printer...`;
-            try {
-                const res=await fetch('/api/print-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ticket)});
-                const data=await res.json();
-                if(res.ok && data.success){
-                    status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-800 border border-emerald-300';
-                    status.textContent=`✅ ${data.copies} label${data.copies > 1 ? 's' : ''} queued. Print job #${data.job_id} sent to EPSON printer.`;
-                } else {
-                    status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';
-                    status.textContent='❌ '+(data.error||'Print job failed');
-                }
-            } catch (error) {
-                status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';
-                status.textContent='❌ Unable to connect to the print service.';
-            }
+            status.textContent='⏳ Sending to printer...';
+            const res=await fetch('/api/print-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ticket)});
+            const data=await res.json();
+            if(res.ok && data.success){status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-800 border border-emerald-300';status.textContent=`✅ Print job #${data.job_id} sent to EPSON printer.`;}
+            else {status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';status.textContent='❌ '+(data.error||'Print job failed');}
         }
 
         function displaySearchResults(items, query, sourceLabel) {
@@ -1279,16 +1258,10 @@ def create_print_job():
     data=request.get_json(silent=True) or {}
     for key in ("article_code","item_name","price"):
         if not str(data.get(key,"")).strip(): return jsonify({"success":False,"error":f"Missing {key}"}),400
-    try:
-        copies = int(data.get("copies", 1))
-    except (TypeError, ValueError):
-        return jsonify({"success":False,"error":"Quantity must be a whole number"}),400
-    if copies < 1 or copies > 100:
-        return jsonify({"success":False,"error":"Quantity must be between 1 and 100"}),400
     with sqlite3.connect(DB_NAME) as conn:
-        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,?,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),copies,datetime.now().isoformat(timespec='seconds')))
+        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,1,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),datetime.now().isoformat(timespec='seconds')))
         conn.commit()
-    return jsonify({"success":True,"job_id":cur.lastrowid,"copies":copies})
+    return jsonify({"success":True,"job_id":cur.lastrowid})
 
 def _bridge_ok():
     key=os.environ.get("PRINT_BRIDGE_KEY","")

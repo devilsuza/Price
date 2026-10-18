@@ -1,1363 +1,191 @@
-import os
-import uuid
-import sqlite3
+import os, re, sqlite3, uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, Response
 import pandas as pd
 
-app = Flask(__name__)
-UPLOAD_FOLDER = "temp_uploads"
-DB_NAME = "store_prices.db"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+BASE_DIR=os.path.dirname(os.path.abspath(__file__))
+DB_NAME=os.getenv("DB_PATH", os.path.join(BASE_DIR,"store_prices.db"))
+UPLOAD_FOLDER=os.path.join(BASE_DIR,"temp_uploads")
+os.makedirs(UPLOAD_FOLDER,exist_ok=True)
+app=Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"]=20*1024*1024
 
+def db():
+    c=sqlite3.connect(DB_NAME); c.row_factory=sqlite3.Row; c.execute("PRAGMA foreign_keys=ON"); return c
 
-# --- DATABASE SETUP & AUTO-MIGRATION ---
 def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                barcode TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                price_cx TEXT DEFAULT '',
-                price_emb TEXT DEFAULT '',
-                price_pc_kgm TEXT DEFAULT '',
-                price_bag TEXT DEFAULT '',
-                updated_at TEXT
-            )
-        """)
-        existing_cols = [
-            row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()
-        ]
-        for col in ["price_cx", "price_emb", "price_pc_kgm", "price_bag", "updated_at"]:
-            if col not in existing_cols:
-                conn.execute(f"ALTER TABLE products ADD COLUMN {col} TEXT DEFAULT ''")
-        conn.commit()
-
-
+    with db() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS products(
+          article_code TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',price_cx TEXT DEFAULT '',
+          price_emb TEXT DEFAULT '',price_pc_kgm TEXT DEFAULT '',price_bag TEXT DEFAULT '',updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS ean_aliases(
+          ean_code TEXT PRIMARY KEY,article_code TEXT NOT NULL,created_at TEXT,
+          FOREIGN KEY(article_code) REFERENCES products(article_code) ON DELETE CASCADE);
+        CREATE INDEX IF NOT EXISTS idx_ean_article ON ean_aliases(article_code);
+        CREATE TABLE IF NOT EXISTS print_jobs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,article_code TEXT NOT NULL,item_name TEXT NOT NULL,
+          price TEXT NOT NULL,unit TEXT NOT NULL DEFAULT 'UN',currency TEXT NOT NULL DEFAULT 'KZ',
+          copies INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,
+          claimed_at TEXT,printed_at TEXT,error_message TEXT);
+        ''')
+        c.execute("INSERT OR IGNORE INTO ean_aliases(ean_code,article_code,created_at) SELECT article_code,article_code,COALESCE(updated_at,'') FROM products")
 init_db()
 
+def clean(v):
+    if v is None or pd.isna(v): return ''
+    s=str(v).strip()
+    return s[:-2] if s.endswith('.0') else s
 
-def clean_barcode(val):
-    if pd.isna(val):
-        return ""
-    s = str(val).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
+def price(v):
+    s=clean(v)
+    if s.lower() in ('','nan','none','-','0','0.0','0.00'): return ''
     return s
 
-
-def format_price(val):
-    if val is None or pd.isna(val):
-        return ""
-    if isinstance(val, (int, float)):
-        if float(val) == 0:
-            return ""
-        return f"{val:,.2f}"
-    s = str(val).strip()
-    if s in ["", "-", "0", "0.0", "0.00", "nan", "None"]:
-        return ""
-    return s
-
-
-# --- PWA MANIFEST JSON ---
-MANIFEST_JSON = """
-{
-  "name": "Store Price Portal",
-  "short_name": "PricePortal",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#f1f5f9",
-  "theme_color": "#4338ca",
-  "icons": [
-    {
-      "src": "https://cdn-icons-png.flaticon.com/512/3081/3081559.png",
-      "sizes": "512x512",
-      "type": "image/png"
-    }
-  ]
-}
-"""
-
-
-# --- SERVICE WORKER FOR OFFLINE CACHING & PWA ---
-SERVICE_WORKER_JS = """
-const CACHE_NAME = 'store-price-portal-v4';
-const ASSETS_TO_CACHE = [
-    '/',
-    'https://cdn.tailwindcss.com',
-    'https://unpkg.com/html5-qrcode',
-    'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'
-];
-
-self.addEventListener('install', (event) => {
-    self.skipWaiting();
-    event.waitUntil(
-        caches.open(CACHE_NAME).then((cache) => {
-            return cache.addAll(ASSETS_TO_CACHE).catch(() => {});
-        })
-    );
-});
-
-self.addEventListener('activate', (event) => {
-    event.waitUntil(
-        caches.keys().then((keys) =>
-            Promise.all(keys.map((k) => k !== CACHE_NAME && caches.delete(k)))
-        )
-    );
-    self.clients.claim();
-});
-
-self.addEventListener('fetch', (event) => {
-    if (event.request.method !== 'GET') return;
-    const url = new URL(event.request.url);
-
-    if (url.pathname.startsWith('/api/')) return;
-
-    event.respondWith(
-        fetch(event.request)
-            .then((response) => {
-                const cloned = response.clone();
-                caches.open(CACHE_NAME).then((cache) => cache.put(event.request, cloned));
-                return response;
-            })
-            .catch(() => caches.match(event.request))
-    );
-});
-"""
-
-
-# --- HTML TEMPLATE (WITH MANAGER EDITABLE PRODUCT TABLE) ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Store Price Checker & Manager Portal</title>
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#4338ca">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/html5-qrcode"></script>
-</head>
-<body class="bg-slate-100 min-h-screen font-sans text-slate-800">
-
-    <!-- ================= LOGIN MODAL OVERLAY ================= -->
-    <div id="login-overlay" class="fixed inset-0 bg-slate-900/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-        <div class="bg-white w-full max-w-sm rounded-2xl shadow-2xl p-6 border border-slate-200 text-center">
-            <div class="w-14 h-14 bg-indigo-100 text-indigo-700 rounded-2xl flex items-center justify-center mx-auto mb-3 text-2xl font-bold shadow-sm">
-                🔐
-            </div>
-            <h2 class="text-xl font-extrabold text-slate-800">Store Portal Login</h2>
-            <p class="text-xs text-slate-500 mt-1 mb-5">Enter PIN for Employee or Manager</p>
-
-            <input type="password" id="login-pin" autofocus
-                placeholder="Enter Password"
-                class="w-full px-4 py-3 text-center text-xl tracking-widest font-bold border-2 border-indigo-300 rounded-xl focus:outline-none focus:border-indigo-600 mb-3">
-            
-            <p id="login-error" class="text-xs font-bold text-red-600 mb-3 hidden">❌ Wrong Password! Try again.</p>
-
-            <button onclick="handleLogin()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-xl shadow-md transition">
-                Login Now
-            </button>
-        </div>
-    </div>
-
-    <!-- ================= TOP NAVIGATION ================= -->
-    <nav class="bg-indigo-700 text-white shadow-lg">
-        <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
-            <div class="flex items-center flex-wrap gap-2">
-                <span class="text-xl font-bold tracking-wide">🏪 Store Price Portal</span>
-                <span id="role-badge" class="text-xs bg-indigo-900 text-indigo-200 px-2.5 py-0.5 rounded-full font-semibold hidden"></span>
-                
-                <div class="flex items-center space-x-1 bg-indigo-800/90 px-3 py-1 rounded-full border border-indigo-500 text-xs font-semibold">
-                    <span id="net-status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block"></span>
-                    <span id="net-status-text">Checking...</span>
-                    <button onclick="syncDatabaseInBackground(true)" id="btn-manual-sync" title="Sync Database Now" class="ml-1.5 text-indigo-200 hover:text-white">
-                        🔄
-                    </button>
-                </div>
-            </div>
-
-            <div class="flex items-center space-x-2">
-                <button id="btn-install-app" onclick="installPWA()" class="hidden px-3 py-1.5 rounded-lg text-sm font-bold bg-emerald-500 hover:bg-emerald-600 text-white shadow-md flex items-center gap-1">
-                    📱 Install App
-                </button>
-                <button onclick="switchMode('scanner')" id="btn-scanner" class="px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow">
-                    🔍 Scanner
-                </button>
-                <button onclick="switchMode('manager')" id="btn-manager" class="px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600">
-                    ⚙️ Manager Panel
-                </button>
-                <button onclick="logoutPortal()" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-red-500/90 hover:bg-red-600 text-white shadow">
-                    🔒 Logout
-                </button>
-            </div>
-        </div>
-    </nav>
-
-    <div class="max-w-5xl mx-auto p-4 mt-2">
-
-        <!-- Offline Mode Banner -->
-        <div id="offline-banner" class="hidden mb-4 bg-amber-50 border-2 border-amber-400 text-amber-900 px-4 py-3 rounded-xl flex items-center justify-between text-sm font-semibold shadow-sm">
-            <div>
-                ⚡ <strong>Offline Mode Active:</strong> Internet band hai, par scanning chalu hai! Data local memory se aa raha hai.
-            </div>
-            <span id="offline-count-label" class="text-xs bg-amber-200 text-amber-900 px-2.5 py-1 rounded-lg font-bold whitespace-nowrap ml-2"></span>
-        </div>
-
-        <!-- ================= EMPLOYEE SCANNER VIEW ================= -->
-        <div id="view-scanner" class="space-y-6">
-            <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200">
-                <div class="flex justify-between items-center mb-3">
-                    <h2 class="text-lg font-bold text-slate-700">Scan Article Barcode or Search Name</h2>
-                    <span id="last-sync-time" class="text-[11px] text-slate-400 font-medium"></span>
-                </div>
-                
-                <div class="flex flex-col sm:flex-row gap-3">
-                    <div class="relative flex-1">
-                        <input type="text" id="scan-input" inputmode="none" autocomplete="off" autocapitalize="off"
-                            placeholder="Scan barcode here or type article code / name..."
-                            class="w-full pl-4 pr-14 py-3 text-lg border-2 border-indigo-300 rounded-xl focus:outline-none focus:border-indigo-600">
-                        
-                        <button type="button" onclick="toggleCamera()" id="inline-scan-btn"
-                            title="Open QR / Barcode Camera Scanner"
-                            class="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg border border-indigo-200 transition flex items-center justify-center shadow-sm">
-                            <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                                <path stroke-linecap="round" stroke-linejoin="round" d="M3 7V5a2 2 0 012-2h2m10 0h2a2 2 0 012 2v2m0 10v2a2 2 0 01-2 2h-2M7 21H5a2 2 0 01-2-2v-2M7 8h1v8H7V8zm3 0h2v8h-2V8zm4 0h1v8h-1V8zm3 0h1v8h-1V8z" />
-                            </svg>
-                        </button>
-                    </div>
-
-                    <button onclick="searchArticle()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-3 rounded-xl shadow">
-                        Check Price
-                    </button>
-                </div>
-
-                <div id="reader-container" class="hidden mt-4 bg-slate-900 p-3 rounded-2xl max-w-sm mx-auto text-center">
-                    <div class="flex justify-between items-center text-white text-xs font-semibold mb-2 px-1">
-                        <span>📷 Point camera at Barcode or QR Code</span>
-                        <button onclick="stopCamera()" class="bg-red-500 hover:bg-red-600 text-white px-2.5 py-1 rounded-md">✕ Close</button>
-                    </div>
-                    <div id="reader" class="w-full overflow-hidden rounded-xl border-2 border-emerald-400 bg-black"></div>
-                </div>
-            </div>
-
-            <div id="price-result" class="hidden space-y-4"></div>
-        </div>
-
-        <!-- ================= MANAGER UPLOAD & EDIT VIEW ================= -->
-        <div id="view-manager" class="hidden space-y-6">
-            
-            <!-- Step 1: Upload Excel -->
-            <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200">
-                <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
-                    <div>
-                        <h2 class="text-xl font-bold text-slate-800">1. Upload Daily Price Excel (Auto-Merge)</h2>
-                        <p class="text-sm text-slate-500">New articles added & existing prices updated automatically</p>
-                    </div>
-                    <span class="bg-indigo-50 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-full border border-indigo-200" id="total-count-badge">
-                        Total Articles in DB: {{ total_products }}
-                    </span>
-                </div>
-
-                <div class="flex flex-col sm:flex-row items-center gap-4">
-                    <input type="file" id="excel-file" accept=".xlsx,.xls,.csv"
-                        class="block w-full text-sm text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 border border-slate-200 rounded-xl p-1.5">
-                    <button onclick="uploadForPreview()" id="btn-upload-preview"
-                        class="w-full sm:w-auto whitespace-nowrap bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-xl shadow">
-                        Read Tabs & Columns
-                    </button>
-                </div>
-                <div id="upload-status" class="mt-3 text-sm font-medium hidden"></div>
-            </div>
-
-            <!-- Step 2: Dynamic Tab & Column Mapping -->
-            <div id="mapping-section" class="hidden bg-white p-6 rounded-2xl shadow-md border border-slate-200 space-y-5">
-                <div>
-                    <h2 class="text-xl font-bold text-slate-800">2. Select Columns for Each Tab</h2>
-                    <p class="text-sm text-slate-500">Map Barcode, Article Name, and the 4 Price columns (CX, EMB, PC/KGM, BAG).</p>
-                </div>
-
-                <div id="tabs-container" class="space-y-6"></div>
-
-                <div class="pt-4 border-t border-slate-200 flex justify-end">
-                    <button onclick="confirmAndImport()" id="btn-confirm-import"
-                        class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-8 py-3 rounded-xl shadow-lg text-base">
-                        ✅ Merge & Update Prices
-                    </button>
-                </div>
-            </div>
-
-            <!-- Step 3: Searchable Product List & Inline Editing Table -->
-            <div class="bg-white p-6 rounded-2xl shadow-md border border-slate-200 space-y-4">
-                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-                    <div>
-                        <h2 class="text-xl font-bold text-slate-800">3. Live Product Catalog & Manual Price Editor</h2>
-                        <p class="text-sm text-slate-500">Search any article and click inside any price box to edit and save instantly.</p>
-                    </div>
-                    <button onclick="loadManagerProductTable()" class="bg-slate-800 hover:bg-slate-900 text-white font-semibold px-4 py-2 rounded-xl text-sm shadow">
-                        🔄 Refresh Table
-                    </button>
-                </div>
-
-                <!-- Search Filter Bar -->
-                <div class="relative">
-                    <input type="text" id="manager-search-input" oninput="filterManagerTable()"
-                        placeholder="Type article code or name to filter table..."
-                        class="w-full pl-4 pr-10 py-2.5 border-2 border-slate-300 rounded-xl focus:outline-none focus:border-indigo-600 text-sm">
-                </div>
-
-                <!-- Product Table Container -->
-                <div class="overflow-x-auto border border-slate-200 rounded-xl max-h-[500px]">
-                    <table class="w-full text-xs text-left bg-white">
-                        <thead class="bg-slate-100 text-slate-700 sticky top-0 uppercase font-bold tracking-wider z-10">
-                            <tr>
-                                <th class="px-3 py-3 border-b">Article Code</th>
-                                <th class="px-3 py-3 border-b">Article Name</th>
-                                <th class="px-3 py-3 border-b text-center">CX</th>
-                                <th class="px-3 py-3 border-b text-center">EMB</th>
-                                <th class="px-3 py-3 border-b text-center">PC / KGM</th>
-                                <th class="px-3 py-3 border-b text-center">BAG</th>
-                                <th class="px-3 py-3 border-b text-center">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="manager-table-body" class="divide-y divide-slate-200">
-                            <tr><td colspan="7" class="text-center py-6 text-slate-400">Loading products... Click Refresh Table if empty.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-        </div>
-
-    </div>
-
-    <script>
-        const EMPLOYEE_PASS = "123";
-        const MANAGER_PASS = "2026";
-        let currentRole = null;
-
-        let currentTempFile = null;
-        let html5QrCode = null;
-        let cameraActive = false;
-        let allManagerProducts = [];
-
-        // PWA Install Prompt
-        let deferredPrompt = null;
-        window.addEventListener('beforeinstallprompt', (e) => {
-            e.preventDefault();
-            deferredPrompt = e;
-            document.getElementById('btn-install-app').classList.remove('hidden');
-        });
-
-        async function installPWA() {
-            if (!deferredPrompt) {
-                alert("App already installed or browser doesn't support direct installation.");
-                return;
-            }
-            deferredPrompt.prompt();
-            const { outcome } = await deferredPrompt.userChoice;
-            if (outcome === 'accepted') {
-                document.getElementById('btn-install-app').classList.add('hidden');
-            }
-            deferredPrompt = null;
-        }
-
-        // Offline IndexedDB Engine
-        const IDB_NAME = "StorePriceOfflineDB";
-        const IDB_VERSION = 1;
-        const STORE_NAME = "products";
-        let dbPromise = null;
-        let localItemCount = 0;
-        let isSyncing = false;
-
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW Error:', err));
-            });
-        }
-
-        function openLocalDB() {
-            if (dbPromise) return dbPromise;
-            dbPromise = new Promise((resolve, reject) => {
-                const request = indexedDB.open(IDB_NAME, IDB_VERSION);
-                request.onupgradeneeded = (e) => {
-                    const db = e.target.result;
-                    if (!db.objectStoreNames.contains(STORE_NAME)) {
-                        db.createObjectStore(STORE_NAME, { keyPath: "barcode" });
-                    }
-                };
-                request.onsuccess = (e) => resolve(e.target.result);
-                request.onerror = (e) => reject(e.target.error);
-            });
-            return dbPromise;
-        }
-
-        async function saveAllToLocalDB(items) {
-            const db = await openLocalDB();
-            return new Promise((resolve, reject) => {
-                const tx = db.transaction(STORE_NAME, "readwrite");
-                const store = tx.objectStore(STORE_NAME);
-                store.clear();
-                for (const item of items) {
-                    store.put(item);
-                }
-                tx.oncomplete = () => {
-                    localItemCount = items.length;
-                    const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    localStorage.setItem("last_sync_time", nowStr);
-                    localStorage.setItem("local_item_count", String(items.length));
-                    resolve(items.length);
-                };
-                tx.onerror = (e) => reject(e.target.error);
-            });
-        }
-
-        async function searchInLocalDB(query) {
-            const db = await openLocalDB();
-            const cleanQ = query.trim();
-            const lowerQ = cleanQ.toLowerCase();
-
-            return new Promise((resolve) => {
-                const tx = db.transaction(STORE_NAME, "readonly");
-                const store = tx.objectStore(STORE_NAME);
-
-                const exactReq = store.get(cleanQ);
-                exactReq.onsuccess = () => {
-                    if (exactReq.result) {
-                        resolve([exactReq.result]);
-                    } else {
-                        const matches = [];
-                        const cursorReq = store.openCursor();
-                        cursorReq.onsuccess = (e) => {
-                            const cursor = e.target.result;
-                            if (cursor && matches.length < 15) {
-                                const item = cursor.value;
-                                const bMatch = item.barcode && item.barcode.toLowerCase().includes(lowerQ);
-                                const nMatch = item.name && item.name.toLowerCase().includes(lowerQ);
-                                if (bMatch || nMatch) {
-                                    matches.push(item);
-                                }
-                                cursor.continue();
-                            } else {
-                                resolve(matches);
-                            }
-                        };
-                        cursorReq.onerror = () => resolve([]);
-                    }
-                };
-                exactReq.onerror = () => resolve([]);
-            });
-        }
-
-        function updateNetworkUI(syncingState = false) {
-            const dot = document.getElementById('net-status-dot');
-            const text = document.getElementById('net-status-text');
-            const banner = document.getElementById('offline-banner');
-            const offlineCountLbl = document.getElementById('offline-count-label');
-            const lastSyncEl = document.getElementById('last-sync-time');
-
-            const savedCount = localStorage.getItem("local_item_count") || localItemCount || 0;
-            const savedTime = localStorage.getItem("last_sync_time") || "";
-
-            if (savedTime && lastSyncEl) {
-                lastSyncEl.innerText = `Local DB Synced at ${savedTime} (${savedCount} articles)`;
-            }
-
-            if (syncingState) {
-                dot.className = "w-2.5 h-2.5 rounded-full bg-blue-400 animate-ping inline-block";
-                text.innerText = "Syncing DB...";
-                return;
-            }
-
-            if (navigator.onLine) {
-                dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block";
-                text.innerText = `Online (${savedCount} Offline Ready)`;
-                banner.classList.add('hidden');
-            } else {
-                dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 inline-block";
-                text.innerText = `Offline Mode (${savedCount} items)`;
-                banner.classList.remove('hidden');
-                if (offlineCountLbl) offlineCountLbl.innerText = `${savedCount} Articles Ready`;
-            }
-        }
-
-        async function syncDatabaseInBackground(showAlert = false) {
-            if (!navigator.onLine || isSyncing) {
-                updateNetworkUI();
-                if (showAlert && !navigator.onLine) {
-                    alert("⚡ Aap abhi Offline hain! Internet connect hone par automatic sync ho jayega.");
-                }
-                return;
-            }
-
-            isSyncing = true;
-            updateNetworkUI(true);
-
-            try {
-                const res = await fetch("/api/sync-all", { cache: "no-store" });
-                const data = await res.json();
-                if (data.success && Array.isArray(data.items)) {
-                    await saveAllToLocalDB(data.items);
-                    document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.items.length}`;
-                    if (showAlert) {
-                        alert(`✅ Sync Complete! ${data.items.length} articles saved for Offline Mode.`);
-                    }
-                }
-            } catch (err) {
-                console.log("Background sync skipped:", err);
-            } finally {
-                isSyncing = false;
-                updateNetworkUI(false);
-            }
-        }
-
-        window.addEventListener('online', () => {
-            updateNetworkUI();
-            syncDatabaseInBackground(false);
-        });
-
-        window.addEventListener('offline', () => {
-            updateNetworkUI();
-        });
-
-        window.addEventListener('DOMContentLoaded', () => {
-            updateNetworkUI();
-            syncDatabaseInBackground(false);
-            setInterval(() => {
-                if (navigator.onLine) syncDatabaseInBackground(false);
-            }, 10 * 60 * 1000);
-        });
-
-
-        // Login & Scanner Logic
-        function playBeep() {
-            try {
-                const AudioCtx = window.AudioContext || window.webkitAudioContext;
-                const ctx = new AudioCtx();
-                const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
-
-                osc.type = "sine";
-                osc.frequency.setValueAtTime(1350, ctx.currentTime);
-                gain.gain.setValueAtTime(0.25, ctx.currentTime);
-
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-
-                osc.start();
-                osc.stop(ctx.currentTime + 0.14);
-            } catch (e) {}
-        }
-
-        document.getElementById('login-pin').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') handleLogin();
-        });
-
-        function handleLogin() {
-            const pinInput = document.getElementById('login-pin');
-            const errEl = document.getElementById('login-error');
-            const pin = pinInput.value.trim();
-
-            if (pin === EMPLOYEE_PASS) {
-                currentRole = "employee";
-                errEl.classList.add('hidden');
-                document.getElementById('login-overlay').classList.add('hidden');
-                updateRoleBadge("👤 Employee");
-                switchMode('scanner');
-            } else if (pin === MANAGER_PASS) {
-                currentRole = "manager";
-                errEl.classList.add('hidden');
-                document.getElementById('login-overlay').classList.add('hidden');
-                updateRoleBadge("👔 Manager");
-                switchMode('manager');
-            } else {
-                errEl.classList.remove('hidden');
-                pinInput.value = "";
-                pinInput.focus();
-            }
-        }
-
-        function updateRoleBadge(text) {
-            const badge = document.getElementById('role-badge');
-            badge.innerText = text;
-            badge.classList.remove('hidden');
-        }
-
-        function logoutPortal() {
-            stopCamera();
-            currentRole = null;
-            document.getElementById('login-pin').value = "";
-            document.getElementById('login-error').classList.add('hidden');
-            document.getElementById('login-overlay').classList.remove('hidden');
-            document.getElementById('login-pin').focus();
-        }
-
-        function switchMode(mode) {
-            if (mode === 'manager' && currentRole !== 'manager') {
-                const askPin = prompt("🔒 Enter Manager Password to access Manager Panel:");
-                if (askPin === MANAGER_PASS) {
-                    currentRole = 'manager';
-                    updateRoleBadge("👔 Manager");
-                } else {
-                    if (askPin !== null) alert("❌ Invalid Manager Password!");
-                    return;
-                }
-            }
-
-            const scannerView = document.getElementById('view-scanner');
-            const managerView = document.getElementById('view-manager');
-            const btnScanner = document.getElementById('btn-scanner');
-            const btnManager = document.getElementById('btn-manager');
-
-            if (mode === 'scanner') {
-                scannerView.classList.remove('hidden');
-                managerView.classList.add('hidden');
-                btnScanner.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow";
-                btnManager.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600";
-                prepareScannerInput();
-            } else {
-                scannerView.classList.add('hidden');
-                managerView.classList.remove('hidden');
-                btnManager.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium bg-white text-indigo-700 shadow";
-                btnScanner.className = "px-3.5 py-1.5 rounded-lg text-sm font-medium text-indigo-100 hover:bg-indigo-600";
-                stopCamera();
-                loadManagerProductTable(); // Load table when entering manager mode
-            }
-        }
-
-        function prepareScannerInput() {
-            const el = document.getElementById('scan-input');
-            el.blur();
-            el.setAttribute('inputmode', 'none');
-        }
-        document.getElementById('scan-input').addEventListener('pointerdown', function() {
-            this.setAttribute('inputmode', 'text');
-        });
-        document.getElementById('scan-input').addEventListener('blur', function() {
-            this.setAttribute('inputmode', 'none');
-        });
-
-        document.getElementById('scan-input').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                playBeep();
-                searchArticle();
-            }
-        });
-
-        function renderPriceBox(label, subLabel, value, colorClass) {
-            const hasPrice = value && value.trim() !== "";
-            return `
-                <div class="${hasPrice ? colorClass : 'bg-slate-50 border-slate-200 opacity-60'} border-2 rounded-2xl p-4 text-center shadow-sm transition">
-                    <span class="text-xs font-extrabold uppercase tracking-wider block text-slate-600">${label}</span>
-                    <span class="text-[11px] text-slate-400 block mb-1">${subLabel}</span>
-                    <span class="${hasPrice ? 'text-2xl sm:text-3xl font-black text-slate-900' : 'text-xl font-bold text-slate-400'} block mt-1">
-                        ${hasPrice ? value : '--'}
-                    </span>
-                </div>
-            `;
-        }
-
-        function displaySearchResults(items, query, sourceLabel) {
-            const resultBox = document.getElementById('price-result');
-            resultBox.classList.remove('hidden');
-
-            if (!items || items.length === 0) {
-                resultBox.innerHTML = `
-                    <div class="bg-red-50 border-2 border-red-300 p-6 rounded-2xl text-center">
-                        <p class="text-2xl font-bold text-red-600">❌ Article Not Found</p>
-                        <p class="text-slate-600 mt-1">No record found for: <strong>${query}</strong> (${sourceLabel})</p>
-                    </div>`;
-                return;
-            }
-
-            resultBox.innerHTML = items.map(item => `
-                <div class="bg-white border-2 border-indigo-500 p-6 rounded-2xl shadow-lg space-y-5">
-                    <div class="border-b border-slate-200 pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                        <div>
-                            <div class="flex items-center gap-2">
-                                <span class="text-xs font-extrabold uppercase tracking-wider bg-indigo-100 text-indigo-800 px-3 py-1 rounded-lg">
-                                    Article Code: ${item.barcode}
-                                </span>
-                                <span class="text-[11px] font-semibold px-2.5 py-0.5 rounded-md ${sourceLabel.includes('Offline') ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}">
-                                    ${sourceLabel}
-                                </span>
-                            </div>
-                            <h3 class="text-2xl sm:text-3xl font-black text-slate-900 mt-2">${item.name}</h3>
-                        </div>
-                    </div>
-
-                    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400')}
-                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400')}
-                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400')}
-                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400')}
-                    </div>
-                </div>
-            `).join('');
-        }
-
-        async function searchArticle(overrideQuery = null) {
-            const inputEl = document.getElementById('scan-input');
-            const query = (overrideQuery !== null ? overrideQuery : inputEl.value).trim();
-            if (!query) return;
-
-            const resultBox = document.getElementById('price-result');
-            resultBox.classList.remove('hidden');
-
-            if (!navigator.onLine) {
-                const localItems = await searchInLocalDB(query);
-                displaySearchResults(localItems, query, "⚡ Offline Local DB");
-                inputEl.select();
-                return;
-            }
-
-            resultBox.innerHTML = `<div class="bg-white p-6 rounded-2xl shadow text-center text-slate-500 font-medium">⏳ Fetching price details...</div>`;
-
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 2500);
-
-                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`, {
-                    signal: controller.signal
-                });
-                clearTimeout(timeoutId);
-
-                const data = await res.json();
-                displaySearchResults(data.items || [], query, "🟢 Online Live DB");
-                inputEl.select();
-            } catch (err) {
-                const localItems = await searchInLocalDB(query);
-                displaySearchResults(localItems, query, "⚡ Offline Local DB");
-                inputEl.select();
-            }
-        }
-
-        function toggleCamera() {
-            if (cameraActive) {
-                stopCamera();
-            } else {
-                const container = document.getElementById('reader-container');
-                const inlineBtn = document.getElementById('inline-scan-btn');
-                container.classList.remove('hidden');
-                inlineBtn.classList.replace('bg-indigo-50', 'bg-emerald-100');
-                inlineBtn.classList.replace('text-indigo-700', 'text-emerald-700');
-
-                html5QrCode = new Html5Qrcode("reader");
-                cameraActive = true;
-
-                html5QrCode.start(
-                    { facingMode: "environment" },
-                    { fps: 12, qrbox: { width: 250, height: 150 } },
-                    (decodedText) => {
-                        playBeep();
-                        const scanBox = document.getElementById('scan-input');
-                        scanBox.value = decodedText;
-                        scanBox.blur();
-                        scanBox.setAttribute('inputmode', 'none');
-                        stopCamera();
-                        searchArticle(decodedText);
-                    },
-                    (errorMessage) => {}
-                ).catch(err => {
-                    alert("Camera open nahi ho paya. Please allow camera permission.");
-                    stopCamera();
-                });
-            }
-        }
-
-        function stopCamera() {
-            const inlineBtn = document.getElementById('inline-scan-btn');
-            inlineBtn.classList.replace('bg-emerald-100', 'bg-indigo-50');
-            inlineBtn.classList.replace('text-emerald-700', 'text-indigo-700');
-
-            if (html5QrCode && cameraActive) {
-                html5QrCode.stop().then(() => {
-                    html5QrCode.clear();
-                }).catch(() => {});
-            }
-            cameraActive = false;
-            document.getElementById('reader-container').classList.add('hidden');
-        }
-
-        // =========================================================================
-        // MANAGER EDITABLE PRODUCT TABLE LOGIC
-        // =========================================================================
-        async function loadManagerProductTable() {
-            const tbody = document.getElementById('manager-table-body');
-            tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">Loading products from database...</td></tr>`;
-
-            try {
-                const res = await fetch("/api/sync-all");
-                const data = await res.json();
-                if (data.success && Array.isArray(data.items)) {
-                    allManagerProducts = data.items;
-                    renderManagerTable(allManagerProducts);
-                } else {
-                    tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-red-500">Failed to load products.</td></tr>`;
-                }
-            } catch (err) {
-                tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-red-500">Network error loading products.</td></tr>`;
-            }
-        }
-
-        function renderManagerTable(items) {
-            const tbody = document.getElementById('manager-table-body');
-            if (items.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">No products found in database.</td></tr>`;
-                return;
-            }
-
-            tbody.innerHTML = items.map(item => `
-                <tr class="hover:bg-slate-50 transition" id="row-${item.barcode}">
-                    <td class="px-3 py-2.5 font-bold text-slate-700">${item.barcode}</td>
-                    <td class="px-3 py-2.5 font-medium text-slate-900 max-w-xs truncate" title="${item.name}">${item.name}</td>
-                    <td class="px-2 py-2 text-center"><input type="text" id="cx-${item.barcode}" value="${item.price_cx || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
-                    <td class="px-2 py-2 text-center"><input type="text" id="emb-${item.barcode}" value="${item.price_emb || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
-                    <td class="px-2 py-2 text-center"><input type="text" id="pc-${item.barcode}" value="${item.price_pc_kgm || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
-                    <td class="px-2 py-2 text-center"><input type="text" id="bag-${item.barcode}" value="${item.price_bag || ''}" class="w-20 p-1.5 text-center border border-slate-300 rounded-lg text-xs font-semibold focus:border-indigo-600 bg-slate-50"></td>
-                    <td class="px-2 py-2 text-center">
-                        <button onclick="saveInlineProduct('${item.barcode}')" class="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow">
-                            💾 Save
-                        </button>
-                    </td>
-                </tr>
-            `).join('');
-        }
-
-        function filterManagerTable() {
-            const query = document.getElementById('manager-search-input').value.toLowerCase().trim();
-            if (!query) {
-                renderManagerTable(allManagerProducts);
-                return;
-            }
-            const filtered = allManagerProducts.filter(item => 
-                (item.barcode && item.barcode.toLowerCase().includes(query)) || 
-                (item.name && item.name.toLowerCase().includes(query))
-            );
-            renderManagerTable(filtered);
-        }
-
-        async function saveInlineProduct(barcode) {
-            const price_cx = document.getElementById(`cx-${barcode}`).value.trim();
-            const price_emb = document.getElementById(`emb-${barcode}`).value.trim();
-            const price_pc_kgm = document.getElementById(`pc-${barcode}`).value.trim();
-            const price_bag = document.getElementById(`bag-${barcode}`).value.trim();
-
-            try {
-                const res = await fetch("/api/update-single", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ barcode, price_cx, price_emb, price_pc_kgm, price_bag })
-                });
-                const data = await res.json();
-                if (data.success) {
-                    // Update local cache array
-                    const idx = allManagerProducts.findIndex(p => p.barcode === barcode);
-                    if (idx !== -1) {
-                        allManagerProducts[idx].price_cx = price_cx;
-                        allManagerProducts[idx].price_emb = price_emb;
-                        allManagerProducts[idx].price_pc_kgm = price_pc_kgm;
-                        allManagerProducts[idx].price_bag = price_bag;
-                    }
-                    await syncDatabaseInBackground(false); // Resync offline DB
-                    alert(`✅ Prices updated successfully for article: ${barcode}`);
-                } else {
-                    alert("❌ Error updating: " + data.error);
-                }
-            } catch (err) {
-                alert("❌ Failed to update price.");
-            }
-        }
-
-
-        // =========================================================================
-        // EXCEL UPLOAD MAPPING LOGIC
-        // =========================================================================
-        async function uploadForPreview() {
-            if (!navigator.onLine) {
-                alert("❌ Excel upload karne ke liye internet connection chahiye.");
-                return;
-            }
-            const fileInput = document.getElementById('excel-file');
-            const statusEl = document.getElementById('upload-status');
-            if (!fileInput.files.length) {
-                alert("Please select an Excel file first.");
-                return;
-            }
-
-            const formData = new FormData();
-            formData.append("file", fileInput.files[0]);
-
-            statusEl.classList.remove('hidden');
-            statusEl.className = "mt-3 text-sm font-medium text-indigo-600";
-            statusEl.innerText = "⏳ Reading Excel tabs and columns...";
-
-            try {
-                const res = await fetch("/api/preview-excel", {
-                    method: "POST",
-                    body: formData
-                });
-                const data = await res.json();
-
-                if (!data.success) {
-                    statusEl.className = "mt-3 text-sm font-medium text-red-600";
-                    statusEl.innerText = "❌ " + data.error;
-                    return;
-                }
-
-                currentTempFile = data.temp_filename;
-                statusEl.className = "mt-3 text-sm font-medium text-emerald-600";
-                statusEl.innerText = `✅ Found ${data.tabs.length} tab(s). Select columns below:`;
-
-                renderTabMappings(data.tabs);
-            } catch (err) {
-                statusEl.className = "mt-3 text-sm font-medium text-red-600";
-                statusEl.innerText = "❌ Failed to read Excel file.";
-            }
-        }
-
-        function guessColumn(columns, keywords) {
-            for (const col of columns) {
-                const lower = col.toLowerCase();
-                if (keywords.some(k => lower.includes(k))) return col;
-            }
-            return "";
-        }
-
-        function renderTabMappings(tabs) {
-            const section = document.getElementById('mapping-section');
-            const container = document.getElementById('tabs-container');
-            section.classList.remove('hidden');
-
-            container.innerHTML = tabs.map((tab) => {
-                const barcodeGuess = guessColumn(tab.columns, ['barcode', 'code', 'cod', 'sku', 'art', 'ean', 'id']);
-                const nameGuess = guessColumn(tab.columns, ['name', 'desc', 'product', 'article', 'item', 'nome']);
-                const cxGuess = guessColumn(tab.columns, ['cx', 'caixa', 'box', 'carton']);
-                const embGuess = guessColumn(tab.columns, ['emb', 'pack', 'pct', 'fardo']);
-                const pcGuess = guessColumn(tab.columns, ['pc', 'kgm', 'kg', 'un', 'unit', 'price', 'preco', 'preço']);
-                const bagGuess = guessColumn(tab.columns, ['bag', 'saco', 'sc']);
-
-                const makeOptions = (selectedVal, placeholderText) => {
-                    let opts = `<option value="">${placeholderText}</option>`;
-                    for (const col of tab.columns) {
-                        const isSel = (col === selectedVal) ? "selected" : "";
-                        opts += `<option value="${col}" ${isSel}>${col}</option>`;
-                    }
-                    return opts;
-                };
-
-                return `
-                <div class="border-2 border-slate-200 rounded-xl p-5 bg-slate-50 tab-config-card" data-tab-name="${tab.sheet_name}">
-                    <div class="flex items-center justify-between pb-3 mb-4 border-b border-slate-200">
-                        <label class="flex items-center space-x-3 cursor-pointer">
-                            <input type="checkbox" class="tab-enable-checkbox w-5 h-5 text-indigo-600 rounded" checked>
-                            <span class="text-lg font-bold text-indigo-900">📑 Tab: ${tab.sheet_name}</span>
-                            <span class="text-xs bg-slate-200 text-slate-700 px-2.5 py-0.5 rounded-full font-semibold">${tab.row_count} rows</span>
-                        </label>
-                    </div>
-
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-                        <div>
-                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Code / Barcode *</label>
-                            <select class="col-barcode w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
-                                ${makeOptions(barcodeGuess, '-- Select Barcode Column --')}
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">Article Name *</label>
-                            <select class="col-name w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
-                                ${makeOptions(nameGuess, '-- Select Name Column --')}
-                            </select>
-                        </div>
-                    </div>
-
-                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 bg-white p-4 rounded-xl border border-slate-200">
-                        <div>
-                            <label class="block text-xs font-bold uppercase text-emerald-700 mb-1">Price</label>
-                            <select class="col-price-cx w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
-                                ${makeOptions(cxGuess, '-- None / Skip --')}
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold uppercase text-blue-700 mb-1">Price</label>
-                            <select class="col-price-emb w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
-                                ${makeOptions(embGuess, '-- None / Skip --')}
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold uppercase text-amber-700 mb-1">Price</label>
-                            <select class="col-price-pc w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
-                                ${makeOptions(pcGuess, '-- None / Skip --')}
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold uppercase text-purple-700 mb-1">Price</label>
-                            <select class="col-price-bag w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-sm">
-                                ${makeOptions(bagGuess, '-- None / Skip --')}
-                            </select>
-                        </div>
-                    </div>
-
-                    <div class="mt-4 overflow-x-auto">
-                        <p class="text-xs font-semibold text-slate-500 mb-1">Sample Preview (First 2 Rows):</p>
-                        <table class="w-full text-xs text-left bg-white border border-slate-200 rounded-lg">
-                            <thead class="bg-slate-100 text-slate-700">
-                                <tr>${tab.columns.map(c => `<th class="px-2 py-1 border-b">${c}</th>`).join('')}</tr>
-                            </thead>
-                            <tbody>
-                                ${tab.sample.map(row => `
-                                    <tr class="border-b">${tab.columns.map(c => `<td class="px-2 py-1 text-slate-600">${row[c] ?? ''}</td>`).join('')}</tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>`;
-            }).join('');
-        }
-
-        async function confirmAndImport() {
-            const cards = document.querySelectorAll('.tab-config-card');
-            const mappings = [];
-
-            for (const card of cards) {
-                const enabled = card.querySelector('.tab-enable-checkbox').checked;
-                if (!enabled) continue;
-
-                const sheetName = card.getAttribute('data-tab-name');
-                const barcodeCol = card.querySelector('.col-barcode').value;
-                const nameCol = card.querySelector('.col-name').value;
-                const priceCxCol = card.querySelector('.col-price-cx').value;
-                const priceEmbCol = card.querySelector('.col-price-emb').value;
-                const pricePcCol = card.querySelector('.col-price-pc').value;
-                const priceBagCol = card.querySelector('.col-price-bag').value;
-
-                if (!barcodeCol || !nameCol) {
-                    alert(`Please select Article Code and Article Name columns for tab: "${sheetName}"`);
-                    return;
-                }
-
-                mappings.push({
-                    sheet_name: sheetName,
-                    barcode_col: barcodeCol,
-                    name_col: nameCol,
-                    price_cx_col: priceCxCol,
-                    price_emb_col: priceEmbCol,
-                    price_pc_col: pricePcCol,
-                    price_bag_col: priceBagCol
-                });
-            }
-
-            if (mappings.length === 0) {
-                alert("Please select at least one tab to import.");
-                return;
-            }
-
-            const btn = document.getElementById('btn-confirm-import');
-            btn.disabled = true;
-            btn.innerText = "⏳ Merging New & Existing Prices...";
-
-            try {
-                const res = await fetch("/api/import-mapped", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        temp_filename: currentTempFile,
-                        mappings: mappings
-                    })
-                });
-                const data = await res.json();
-
-                btn.disabled = false;
-                btn.innerText = "✅ Merge & Update Prices";
-
-                if (data.success) {
-                    await syncDatabaseInBackground(false);
-                    loadManagerProductTable(); // Refresh table
-                    alert(
-                        `✅ Merge & Offline Sync Complete!\n\n` +
-                        `🆕 New Added: ${data.new_added}\n` +
-                        `🔄 Updated: ${data.existing_updated}\n` +
-                        `📦 Total in DB: ${data.total_products}`
-                    );
-                    document.getElementById('total-count-badge').innerText = `Total Articles in DB: ${data.total_products}`;
-                    document.getElementById('mapping-section').classList.add('hidden');
-                } else {
-                    alert("❌ Error: " + data.error);
-                }
-            } catch (err) {
-                btn.disabled = false;
-                btn.innerText = "✅ Merge & Update Prices";
-                alert("❌ Failed to merge data.");
-            }
-        }
-    </script>
-</body>
-</html>
-"""
-
-
-# --- ROUTES ---
-@app.route("/")
-def index():
-    with sqlite3.connect(DB_NAME) as conn:
-        total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-    return render_template_string(HTML_TEMPLATE, total_products=total)
-
-
-@app.route("/manifest.json")
-def manifest():
-    return Response(MANIFEST_JSON, mimetype="application/json")
-
-
-@app.route("/sw.js")
-def service_worker():
-    return Response(SERVICE_WORKER_JS, mimetype="application/javascript")
-
-
-@app.route("/api/sync-all")
-def api_sync_all():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at FROM products"
-        ).fetchall()
-    items = [dict(r) for r in rows]
-    return jsonify({"success": True, "count": len(items), "items": items})
-
-
-@app.route("/api/update-single", methods=["POST"])
-def update_single():
-    data = request.get_json()
-    barcode = data.get("barcode")
-    if not barcode:
-        return jsonify({"success": False, "error": "Missing barcode"})
-
-    p_cx = data.get("price_cx", "").strip()
-    p_emb = data.get("price_emb", "").strip()
-    p_pc = data.get("price_pc_kgm", "").strip()
-    p_bag = data.get("price_bag", "").strip()
-    now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
-
+def now(): return datetime.now().strftime('%d-%b-%Y %H:%M')
+
+def read_sheet(path,sheet):
+    return pd.read_csv(path,dtype=str) if path.lower().endswith('.csv') else pd.read_excel(path,sheet_name=sheet,dtype=str)
+
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fresmart Price Portal</title><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/html5-qrcode"></script>
+<style>body{background:#f1f5f9}.tab.active{background:#fff;color:#4338ca}.toast{position:fixed;right:18px;bottom:18px;z-index:99}.modal{position:fixed;inset:0;background:rgba(15,23,42,.88);z-index:100;display:flex;align-items:center;justify-content:center;padding:18px}.hidden{display:none!important}#reader video{border-radius:14px}</style></head>
+<body class="text-slate-800"><div id="loginModal" class="modal"><div class="bg-white max-w-sm w-full rounded-3xl p-6 shadow-2xl"><h1 class="text-2xl font-black text-indigo-700 text-center">FRESMART LOGIN</h1><p class="text-sm text-slate-500 text-center">Select role and enter PIN</p><div class="grid grid-cols-2 gap-3 mt-5"><button id="roleEmployee" onclick="pickRole('employee')" class="border-2 border-indigo-600 bg-indigo-50 rounded-xl p-3 font-bold text-indigo-700">Employee</button><button id="roleManager" onclick="pickRole('manager')" class="border-2 border-slate-200 rounded-xl p-3 font-bold">Manager</button></div><input id="loginPin" type="password" inputmode="numeric" class="mt-4 w-full border-2 border-indigo-300 rounded-xl px-4 py-3 text-center text-xl" placeholder="Enter PIN"><button onclick="login()" class="mt-3 w-full bg-indigo-600 text-white py-3 rounded-xl font-black">LOGIN</button><p id="loginError" class="hidden mt-3 text-center text-red-600 font-bold">Invalid PIN</p><p class="mt-4 text-xs text-center text-slate-400">Employee: 123 | Manager: 2026</p></div></div><header class="bg-indigo-700 text-white shadow"><div class="max-w-7xl mx-auto p-4 flex flex-wrap gap-3 justify-between items-center"><div><h1 class="text-xl font-black">FRESMART PRICE PORTAL</h1><p class="text-xs text-indigo-200">EAN Search · Master Merge · Daily Price Update · Label Printing</p></div><div class="bg-indigo-600 p-1 rounded-xl"><button id="tSearch" onclick="showTab('search')" class="tab active px-4 py-2 rounded-lg font-bold">Search & Print</button><button id="tManager" onclick="showTab('manager')" class="tab hidden px-4 py-2 rounded-lg font-bold">Manager</button><button onclick="logout()" class="ml-2 bg-red-500 px-3 py-2 rounded-lg font-bold">Logout</button></div></div></header>
+<main class="max-w-7xl mx-auto p-4 md:p-6">
+<section id="searchTab"><div class="bg-white rounded-2xl shadow p-5"><div class="flex justify-between mb-3"><h2 class="font-black text-lg">Scan EAN / Search Article</h2><span id="scanStatus" class="text-xs font-bold text-slate-500">Scanner off</span></div><div class="flex flex-col sm:flex-row gap-2"><div class="relative flex-1"><input id="q" readonly inputmode="none" autocomplete="off" class="w-full border-2 border-indigo-300 rounded-xl px-4 pr-24 py-3 text-lg" placeholder="Scan barcode or tap Type"><button id="typeBtn" onclick="enableTyping()" class="absolute right-2 top-2 bg-slate-100 px-3 py-2 rounded-lg font-bold">Type</button></div><button onclick="search()" class="bg-indigo-600 text-white rounded-xl px-6 py-3 font-bold">SEARCH</button><button id="cameraBtn" onclick="toggleScanner()" class="bg-emerald-600 text-white rounded-xl px-6 py-3 font-bold">SCAN</button></div><div id="readerWrap" class="hidden mt-4 max-w-lg mx-auto"><div id="reader" class="overflow-hidden border-2 border-emerald-400 rounded-2xl"></div><button onclick="stopScanner()" class="mt-2 w-full bg-red-500 text-white py-2 rounded-xl font-bold">STOP CAMERA</button></div><div id="results" class="mt-5 space-y-4"></div></div></section>
+<section id="managerTab" class="hidden space-y-5"><div class="grid lg:grid-cols-2 gap-5">
+<div class="bg-white rounded-2xl shadow p-5 border-2 border-indigo-200"><h2 class="font-black text-lg">Master Sheet Merge</h2><p class="text-sm text-slate-500 mb-3">New articles/EANs add honge. Blank cells old data ko erase nahi karenge.</p><input id="masterFile" type="file" accept=".xlsx,.xls,.csv" class="w-full border rounded-xl p-2"><button onclick="preview('master')" class="mt-3 w-full bg-indigo-600 text-white py-3 rounded-xl font-bold">READ MASTER FILE</button></div>
+<div class="bg-white rounded-2xl shadow p-5 border-2 border-amber-200"><h2 class="font-black text-lg">Daily Price Update</h2><p class="text-sm text-slate-500 mb-3">Sirf uploaded non-empty prices update honge.</p><input id="priceFile" type="file" accept=".xlsx,.xls,.csv" class="w-full border rounded-xl p-2"><button onclick="preview('price')" class="mt-3 w-full bg-amber-500 text-white py-3 rounded-xl font-bold">READ PRICE FILE</button></div></div>
+<div id="mapping" class="hidden bg-white rounded-2xl shadow p-5"><h2 class="font-black text-lg mb-3">Column Mapping</h2><div id="mapBody"></div><button onclick="runImport()" class="mt-4 bg-emerald-600 text-white px-6 py-3 rounded-xl font-bold">SAVE / UPDATE</button></div>
+<div class="bg-white rounded-2xl shadow p-5"><div class="flex justify-between mb-3"><h2 class="font-black text-lg">Master Articles</h2><button onclick="loadProducts()" class="text-indigo-700 font-bold">Refresh</button></div><div class="overflow-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-100"><th class="p-2 text-left">Article</th><th class="p-2 text-left">Name</th><th>CX</th><th>EMB</th><th>PC/KGM</th><th>BAG</th><th>EANs</th></tr></thead><tbody id="products"></tbody></table></div></div></section>
+</main><div id="toast" class="toast hidden px-5 py-3 rounded-xl shadow-xl font-bold"></div>
+<script>
+const PINS={employee:'123',manager:'2026'}; let selectedRole='employee',currentRole='',tempFile='',mode='',tabs=[],scanner=null,scanning=false,lastScan='',lastScanAt=0;
+function toast(m,ok=true){let e=document.getElementById('toast');e.textContent=m;e.className='toast px-5 py-3 rounded-xl shadow-xl font-bold '+(ok?'bg-emerald-600':'bg-red-600')+' text-white';setTimeout(()=>e.classList.add('hidden'),3500)}
+function showTab(x){if(x==='manager'&&currentRole!=='manager'){toast('Manager access required',false);return}stopScanner();document.getElementById('searchTab').classList.toggle('hidden',x!='search');document.getElementById('managerTab').classList.toggle('hidden',x!='manager');document.getElementById('tSearch').classList.toggle('active',x=='search');document.getElementById('tManager').classList.toggle('active',x=='manager');if(x==='manager')loadProducts();else lockKeyboard()}
+function pickRole(r){selectedRole=r;document.getElementById('roleEmployee').className='border-2 rounded-xl p-3 font-bold '+(r==='employee'?'border-indigo-600 bg-indigo-50 text-indigo-700':'border-slate-200');document.getElementById('roleManager').className='border-2 rounded-xl p-3 font-bold '+(r==='manager'?'border-indigo-600 bg-indigo-50 text-indigo-700':'border-slate-200')}
+function login(){if(document.getElementById('loginPin').value!==PINS[selectedRole]){document.getElementById('loginError').classList.remove('hidden');return}currentRole=selectedRole;sessionStorage.setItem('role',currentRole);document.getElementById('loginModal').classList.add('hidden');applyRole();lockKeyboard()}
+function applyRole(){document.getElementById('tManager').classList.toggle('hidden',currentRole!=='manager');if(currentRole!=='manager')showTab('search')}
+function logout(){stopScanner();sessionStorage.removeItem('role');currentRole='';document.getElementById('loginPin').value='';document.getElementById('loginModal').classList.remove('hidden')}
+function lockKeyboard(){let q=document.getElementById('q');q.readOnly=true;q.setAttribute('inputmode','none');q.blur();document.getElementById('typeBtn').textContent='Type'}
+function enableTyping(){let q=document.getElementById('q');q.readOnly=false;q.setAttribute('inputmode','text');q.focus();document.getElementById('typeBtn').textContent='Lock'}
+function beep(){try{let a=new(window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=1050;g.gain.setValueAtTime(.2,a.currentTime);g.gain.exponentialRampToValueAtTime(.001,a.currentTime+.15);o.start();o.stop(a.currentTime+.15)}catch(e){}}
+async function toggleScanner(){if(scanning)return stopScanner();if(typeof Html5Qrcode==='undefined'){toast('Scanner library load nahi hui',false);return}lockKeyboard();document.getElementById('readerWrap').classList.remove('hidden');scanner=new Html5Qrcode('reader');try{await scanner.start({facingMode:'environment'},{fps:12,qrbox:{width:280,height:150}},onScan,()=>{});scanning=true;document.getElementById('scanStatus').textContent='Scanner active';document.getElementById('cameraBtn').textContent='STOP'}catch(e){toast('Camera permission allow karein',false);document.getElementById('readerWrap').classList.add('hidden')}}
+async function stopScanner(){if(scanner&&scanning){try{await scanner.stop();await scanner.clear()}catch(e){}}scanner=null;scanning=false;document.getElementById('readerWrap').classList.add('hidden');document.getElementById('scanStatus').textContent='Scanner off';document.getElementById('cameraBtn').textContent='SCAN';lockKeyboard()}
+function onScan(text){let n=Date.now();if(text===lastScan&&n-lastScanAt<1800)return;lastScan=text;lastScanAt=n;beep();document.getElementById('q').value=text;lockKeyboard();search();stopScanner()}
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter'){search();lockKeyboard()}});document.getElementById('q').addEventListener('blur',()=>setTimeout(lockKeyboard,100));
+async function search(){let q=document.getElementById('q').value.trim();if(!q)return;lockKeyboard();let d=await fetch('/api/search?q='+encodeURIComponent(q)).then(r=>r.json());let box=document.getElementById('results');if(!d.items.length){box.innerHTML='<div class="p-6 bg-red-50 border border-red-300 rounded-xl font-bold text-red-700">Article not found</div>';return}box.innerHTML=d.items.map(item=>`<div class="bg-white border-2 border-indigo-300 rounded-2xl p-5"><div class="mb-4"><span class="bg-indigo-100 text-indigo-800 px-3 py-1 rounded-lg font-black">${esc(item.article_code)}</span><h3 class="text-xl font-black mt-2">${esc(item.name)}</h3></div><div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">${card(item,'price_cx','CX','CX')}${card(item,'price_emb','EMB','EMB')}${card(item,'price_pc_kgm','PC / KGM','PC/KGM')}${card(item,'price_bag','BAG','BAG')}</div><div id="ps" class="mt-3"></div></div>`).join('')}
+function esc(v){return String(v??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]))}
+function card(i,k,l,u){let v=i[k]||'';let t=encodeURIComponent(JSON.stringify({article_code:i.article_code,item_name:i.name,price:v,unit:u,currency:'KZ'}));return `<button ${v?`onclick="printLabel('${t}')"`:'disabled'} class="border-2 rounded-xl p-4 ${v?'border-indigo-300 hover:bg-indigo-50':'opacity-40'}"><b>${l}</b><span class="block text-2xl font-black">${v||'--'}</span>${v?'<small>PRINT LABEL</small>':''}</button>`}
+async function printLabel(x){let t=JSON.parse(decodeURIComponent(x));let q=prompt('Label quantity (1-100)','1');if(q===null)return;let n=Number(q);if(!Number.isInteger(n)||n<1||n>100){toast('Quantity 1 se 100 tak whole number honi chahiye',false);return}t.copies=n;let r=await fetch('/api/print-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)});let d=await r.json();toast(d.success?`${n} label(s) print queue me add hue`:(d.error||'Print failed'),d.success)}
+async function preview(m){mode=m;let f=document.getElementById(m==='master'?'masterFile':'priceFile').files[0];if(!f){toast('File select karein',false);return}let fd=new FormData();fd.append('file',f);let r=await fetch('/api/preview',{method:'POST',body:fd});let d=await r.json();if(!d.success){toast(d.error,false);return}tempFile=d.temp_filename;tabs=d.tabs;renderMap();}
+function opts(cols,guess,optional=true){let a=optional?'<option value="">-- Not selected --</option>':'';return a+cols.map(c=>`<option ${guess.some(g=>c.toLowerCase().includes(g))?'selected':''}>${esc(c)}</option>`).join('')}
+function renderMap(){let b=document.getElementById('mapBody');b.innerHTML=tabs.map((t,i)=>`<div class="map border rounded-xl p-4 mb-3" data-sheet="${esc(t.sheet_name)}"><b>${esc(t.sheet_name)} (${t.row_count} rows)</b><div class="grid md:grid-cols-3 gap-3 mt-3"><label>Article Code / EAN<select class="code w-full border p-2 rounded">${opts(t.columns,mode==='master'?['article','artigo','item code','sku']:['ean','barcode','article'],false)}</select></label><label class="${mode==='price'?'hidden':''}">EAN Column<select class="ean w-full border p-2 rounded">${opts(t.columns,['ean','barcode'])}</select></label><label>Name<select class="name w-full border p-2 rounded">${opts(t.columns,['name','description','descricao'])}</select></label><label>Price CX<select class="cx w-full border p-2 rounded">${opts(t.columns,['price cx','preco cx','cx'])}</select></label><label>Price EMB<select class="emb w-full border p-2 rounded">${opts(t.columns,['price emb','preco emb','emb'])}</select></label><label>Price PC/KGM<select class="pc w-full border p-2 rounded">${opts(t.columns,['pc/kgm','price pc','preco pc','kgm'])}</select></label><label>Price BAG<select class="bag w-full border p-2 rounded">${opts(t.columns,['price bag','preco bag','bag'])}</select></label></div></div>`).join('');document.getElementById('mapping').classList.remove('hidden')}
+async function runImport(){let maps=[...document.querySelectorAll('.map')].map(x=>({sheet_name:x.dataset.sheet,code_col:x.querySelector('.code').value,ean_col:x.querySelector('.ean').value,name_col:x.querySelector('.name').value,cx_col:x.querySelector('.cx').value,emb_col:x.querySelector('.emb').value,pc_col:x.querySelector('.pc').value,bag_col:x.querySelector('.bag').value}));let r=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({temp_filename:tempFile,mode,mappings:maps})});let d=await r.json();toast(d.success?`Added ${d.added}, Updated ${d.updated}, EAN linked ${d.ean_linked}, Skipped ${d.skipped}`:d.error,d.success);if(d.success){loadProducts();document.getElementById('mapping').classList.add('hidden')}}
+async function loadProducts(){let d=await fetch('/api/products').then(r=>r.json());document.getElementById('products').innerHTML=d.items.map(x=>`<tr class="border-b"><td class="p-2 font-bold">${esc(x.article_code)}</td><td class="p-2">${esc(x.name)}</td><td class="text-center">${esc(x.price_cx)}</td><td class="text-center">${esc(x.price_emb)}</td><td class="text-center">${esc(x.price_pc_kgm)}</td><td class="text-center">${esc(x.price_bag)}</td><td class="text-center">${x.ean_count}</td></tr>`).join('')}
+window.addEventListener('load',()=>{let r=sessionStorage.getItem('role');if(r&&PINS[r]){currentRole=r;document.getElementById('loginModal').classList.add('hidden');applyRole()}lockKeyboard()});
+</script></body></html>'''
+
+@app.get('/')
+def home(): return render_template_string(HTML)
+
+@app.get('/health')
+def health(): return jsonify(ok=True)
+
+@app.get('/api/search')
+def search():
+    q=clean(request.args.get('q')); like=f'%{q}%'
+    with db() as c:
+        exact=c.execute('''SELECT DISTINCT p.* FROM products p LEFT JOIN ean_aliases e ON e.article_code=p.article_code WHERE p.article_code=? OR e.ean_code=? LIMIT 20''',(q,q)).fetchall()
+        rows=exact or c.execute('''SELECT DISTINCT p.* FROM products p LEFT JOIN ean_aliases e ON e.article_code=p.article_code WHERE p.name LIKE ? OR p.article_code LIKE ? OR e.ean_code LIKE ? LIMIT 20''',(like,like,like)).fetchall()
+    return jsonify(items=[dict(x) for x in rows])
+
+@app.get('/api/products')
+def products():
+    with db() as c: rows=c.execute('''SELECT p.*,COUNT(e.ean_code) ean_count FROM products p LEFT JOIN ean_aliases e ON e.article_code=p.article_code GROUP BY p.article_code ORDER BY p.name LIMIT 5000''').fetchall()
+    return jsonify(items=[dict(x) for x in rows])
+
+@app.post('/api/preview')
+def preview():
+    f=request.files.get('file')
+    if not f or not f.filename: return jsonify(success=False,error='File missing'),400
+    ext=os.path.splitext(f.filename)[1].lower()
+    if ext not in ('.csv','.xlsx','.xls'): return jsonify(success=False,error='Only CSV/XLSX/XLS allowed'),400
+    name=uuid.uuid4().hex+ext; path=os.path.join(UPLOAD_FOLDER,name); f.save(path)
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.execute(
-                """
-                UPDATE products SET
-                    price_cx = ?,
-                    price_emb = ?,
-                    price_pc_kgm = ?,
-                    price_bag = ?,
-                    updated_at = ?
-                WHERE barcode = ?
-            """,
-                (p_cx, p_emb, p_pc, p_bag, now_str, barcode),
-            )
-            conn.commit()
-        return jsonify({"success": True})
+        sheets=['CSV_Data'] if ext=='.csv' else pd.ExcelFile(path).sheet_names
+        tabs=[]
+        for sh in sheets:
+            d=read_sheet(path,sh).dropna(how='all'); tabs.append({'sheet_name':sh,'columns':[str(x) for x in d.columns],'row_count':len(d)})
+        return jsonify(success=True,temp_filename=name,tabs=tabs)
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        try: os.remove(path)
+        except OSError: pass
+        return jsonify(success=False,error=str(e)),400
 
-
-@app.route("/api/search")
-def api_search():
-    q = clean_barcode(request.args.get("q", ""))
-    if not q:
-        return jsonify({"found": False, "items": []})
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        resolved = conn.execute("SELECT article_code FROM ean_aliases WHERE ean_code = ?", (q,)).fetchone()
-        article_code = resolved[0] if resolved else q
-        rows = conn.execute(
-            "SELECT barcode, name, price_cx, price_emb, price_pc_kgm, price_bag FROM products WHERE barcode = ?",
-            (article_code,),
-        ).fetchall()
-        if not rows:
-            like_q = f"%{q}%"
-            rows = conn.execute(
-                """SELECT DISTINCT p.barcode, p.name, p.price_cx, p.price_emb, p.price_pc_kgm, p.price_bag
-                   FROM products p LEFT JOIN ean_aliases e ON e.article_code = p.barcode
-                   WHERE p.name LIKE ? OR p.barcode LIKE ? OR e.ean_code LIKE ? LIMIT 15""",
-                (like_q, like_q, like_q),
-            ).fetchall()
-    items = [dict(r) for r in rows]
-    return jsonify({"found": len(items) > 0, "items": items})
-
-
-@app.route("/api/preview-excel", methods=["POST"])
-def preview_excel():
-    if "file" not in request.files:
-        return jsonify({"success": False, "error": "No file uploaded"})
-
-    f = request.files["file"]
-    if not f.filename:
-        return jsonify({"success": False, "error": "Empty filename"})
-
-    ext = os.path.splitext(f.filename)[1].lower()
-    temp_filename = f"{uuid.uuid4().hex}{ext}"
-    filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
-    f.save(filepath)
-
+@app.post('/api/import')
+def do_import():
+    x=request.get_json(silent=True) or {}; mode=x.get('mode'); filename=os.path.basename(x.get('temp_filename',''))
+    path=os.path.join(UPLOAD_FOLDER,filename)
+    if mode not in ('master','price') or not os.path.exists(path): return jsonify(success=False,error='Invalid or expired import'),400
+    added=updated=ean_linked=skipped=0
     try:
-        tabs_info = []
-        if ext == ".csv":
-            df = pd.read_csv(filepath)
-            df = df.dropna(how="all")
-            cols = [str(c) for c in df.columns]
-            sample = df.head(2).fillna("").astype(str).to_dict(orient="records")
-            tabs_info.append({
-                "sheet_name": "CSV_Data",
-                "columns": cols,
-                "row_count": len(df),
-                "sample": sample,
-            })
-        else:
-            excel_file = pd.ExcelFile(filepath)
-            for sheet in excel_file.sheet_names:
-                df = excel_file.parse(sheet)
-                df = df.dropna(how="all")
-                if len(df.columns) == 0:
-                    continue
-                cols = [str(c) for c in df.columns]
-                sample = (
-                    df.head(2).fillna("").astype(str).to_dict(orient="records")
-                )
-                tabs_info.append({
-                    "sheet_name": sheet,
-                    "columns": cols,
-                    "row_count": len(df),
-                    "sample": sample,
-                })
+      with db() as c:
+       for m in x.get('mappings',[]):
+        d=read_sheet(path,m['sheet_name']).dropna(how='all')
+        for _,r in d.iterrows():
+         code=clean(r.get(m['code_col']))
+         if not code: skipped+=1; continue
+         vals={'price_cx':price(r.get(m.get('cx_col'))) if m.get('cx_col') else '', 'price_emb':price(r.get(m.get('emb_col'))) if m.get('emb_col') else '', 'price_pc_kgm':price(r.get(m.get('pc_col'))) if m.get('pc_col') else '', 'price_bag':price(r.get(m.get('bag_col'))) if m.get('bag_col') else ''}
+         if mode=='price':
+          a=c.execute('SELECT article_code FROM ean_aliases WHERE ean_code=?',(code,)).fetchone(); article=a[0] if a else code
+          if not c.execute('SELECT 1 FROM products WHERE article_code=?',(article,)).fetchone(): skipped+=1; continue
+          sets=[];v=[]
+          for k,z in vals.items():
+           if z: sets.append(k+'=?');v.append(z)
+          if not sets: skipped+=1;continue
+          sets.append('updated_at=?');v.extend([now(),article]);c.execute('UPDATE products SET '+','.join(sets)+' WHERE article_code=?',v);updated+=1;continue
+         article=code; exists=c.execute('SELECT 1 FROM products WHERE article_code=?',(article,)).fetchone(); nm=clean(r.get(m.get('name_col'))) if m.get('name_col') else ''
+         stored_name=nm if nm else (article if not exists else '')
+         c.execute('''INSERT INTO products(article_code,name,price_cx,price_emb,price_pc_kgm,price_bag,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(article_code) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE products.name END,price_cx=CASE WHEN excluded.price_cx<>'' THEN excluded.price_cx ELSE products.price_cx END,price_emb=CASE WHEN excluded.price_emb<>'' THEN excluded.price_emb ELSE products.price_emb END,price_pc_kgm=CASE WHEN excluded.price_pc_kgm<>'' THEN excluded.price_pc_kgm ELSE products.price_pc_kgm END,price_bag=CASE WHEN excluded.price_bag<>'' THEN excluded.price_bag ELSE products.price_bag END,updated_at=excluded.updated_at''',(article,stored_name,vals['price_cx'],vals['price_emb'],vals['price_pc_kgm'],vals['price_bag'],now()))
+         added+=int(not exists);updated+=int(bool(exists)); aliases=[article]
+         if m.get('ean_col'):
+          aliases += [clean(y) for y in re.split(r'[,;|\n]+',clean(r.get(m['ean_col']))) if clean(y)]
+         for e in dict.fromkeys(aliases): c.execute('INSERT INTO ean_aliases(ean_code,article_code,created_at) VALUES(?,?,?) ON CONFLICT(ean_code) DO UPDATE SET article_code=excluded.article_code',(e,article,now()));ean_linked+=1
+      try: os.remove(path)
+      except OSError: pass
+      return jsonify(success=True,added=added,updated=updated,ean_linked=ean_linked,skipped=skipped)
+    except Exception as e: return jsonify(success=False,error=str(e)),500
 
-        if not tabs_info:
-            return jsonify({
-                "success": False,
-                "error": "No valid data tabs found in the file.",
-            })
+@app.post('/api/print-jobs')
+def add_print():
+    x=request.get_json(silent=True) or {}
+    for k in ('article_code','item_name','price'):
+        if not clean(x.get(k)): return jsonify(success=False,error='Missing '+k),400
+    try: copies=int(x.get('copies',1))
+    except: return jsonify(success=False,error='Invalid quantity'),400
+    if not 1<=copies<=100:return jsonify(success=False,error='Quantity must be 1-100'),400
+    with db() as c:
+        cur=c.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,?,'pending',?)",(clean(x['article_code']),clean(x['item_name']),clean(x['price']),clean(x.get('unit')) or 'UN',clean(x.get('currency')) or 'KZ',copies,datetime.now().isoformat(timespec='seconds')))
+    return jsonify(success=True,job_id=cur.lastrowid,copies=copies)
 
-        return jsonify({
-            "success": True,
-            "temp_filename": temp_filename,
-            "tabs": tabs_info,
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+def bridge_ok():
+    key=os.getenv('PRINT_BRIDGE_KEY','');return bool(key) and request.headers.get('X-Print-Bridge-Key')==key
+@app.get('/api/print-jobs/next')
+def next_print():
+    if not bridge_ok():return jsonify(error='Unauthorized'),401
+    with db() as c:
+        r=c.execute("SELECT * FROM print_jobs WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        if not r:return Response(status=204)
+        c.execute("UPDATE print_jobs SET status='claimed',claimed_at=? WHERE id=?",(datetime.now().isoformat(timespec='seconds'),r['id']))
+    return jsonify(dict(r))
+@app.post('/api/print-jobs/<int:jid>/complete')
+def complete(jid):
+    if not bridge_ok():return jsonify(error='Unauthorized'),401
+    x=request.get_json(silent=True) or {};ok=bool(x.get('success'))
+    with db() as c:
+        if ok:c.execute("UPDATE print_jobs SET status='printed',printed_at=?,error_message=NULL WHERE id=?",(datetime.now().isoformat(timespec='seconds'),jid))
+        else:c.execute("UPDATE print_jobs SET status='pending',error_message=? WHERE id=?",(clean(x.get('error'))[:500],jid))
+    return jsonify(success=True)
 
-
-@app.route("/api/import-mapped", methods=["POST"])
-def import_mapped():
-    data = request.get_json()
-    temp_filename = data.get("temp_filename")
-    mappings = data.get("mappings", [])
-
-    if not temp_filename or not mappings:
-        return jsonify(
-            {"success": False, "error": "Missing file or column mappings"}
-        )
-
-    filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
-    if not os.path.exists(filepath):
-        return jsonify({
-            "success": False,
-            "error": "Temporary file expired. Please upload again.",
-        })
-
-    ext = os.path.splitext(filepath)[1].lower()
-    now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
-    new_added = 0
-    existing_updated = 0
-
-    try:
-        with sqlite3.connect(DB_NAME) as conn:
-            existing_barcodes = {
-                row[0]
-                for row in conn.execute("SELECT barcode FROM products").fetchall()
-            }
-
-            for m in mappings:
-                sheet = m["sheet_name"]
-                b_col = m["barcode_col"]
-                n_col = m["name_col"]
-                cx_col = m.get("price_cx_col", "")
-                emb_col = m.get("price_emb_col", "")
-                pc_col = m.get("price_pc_col", "")
-                bag_col = m.get("price_bag_col", "")
-
-                if ext == ".csv":
-                    df = pd.read_csv(filepath)
-                else:
-                    df = pd.read_excel(filepath, sheet_name=sheet)
-
-                df = df.dropna(how="all")
-
-                records_to_upsert = []
-                for _, row in df.iterrows():
-                    uploaded_id = clean_barcode(row.get(b_col))
-                    if not uploaded_id:
-                        continue
-                    alias_row = conn.execute(
-                        "SELECT article_code FROM ean_aliases WHERE ean_code = ?", (uploaded_id,)
-                    ).fetchone()
-                    barcode = alias_row[0] if alias_row else uploaded_id
-                    name = (
-                        str(row.get(n_col, "")).strip()
-                        if not pd.isna(row.get(n_col))
-                        else ""
-                    )
-
-                    p_cx = format_price(row.get(cx_col)) if cx_col else ""
-                    p_emb = format_price(row.get(emb_col)) if emb_col else ""
-                    p_pc = format_price(row.get(pc_col)) if pc_col else ""
-                    p_bag = format_price(row.get(bag_col)) if bag_col else ""
-
-                    if not any([p_cx, p_emb, p_pc, p_bag]) and not name:
-                        continue
-
-                    if barcode in existing_barcodes:
-                        existing_updated += 1
-                    else:
-                        new_added += 1
-                        existing_barcodes.add(barcode)
-
-                    records_to_upsert.append(
-                        (barcode, name, p_cx, p_emb, p_pc, p_bag, now_str)
-                    )
-
-                conn.executemany(
-                    """
-                    INSERT INTO products (barcode, name, price_cx, price_emb, price_pc_kgm, price_bag, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(barcode) DO UPDATE SET
-                        name = CASE WHEN excluded.name != '' THEN excluded.name ELSE products.name END,
-                        price_cx = CASE WHEN excluded.price_cx != '' THEN excluded.price_cx ELSE products.price_cx END,
-                        price_emb = CASE WHEN excluded.price_emb != '' THEN excluded.price_emb ELSE products.price_emb END,
-                        price_pc_kgm = CASE WHEN excluded.price_pc_kgm != '' THEN excluded.price_pc_kgm ELSE products.price_pc_kgm END,
-                        price_bag = CASE WHEN excluded.price_bag != '' THEN excluded.price_bag ELSE products.price_bag END,
-                        updated_at = excluded.updated_at
-                    """,
-                    records_to_upsert,
-                )
-
-            conn.commit()
-
-            total_products = conn.execute(
-                "SELECT COUNT(*) FROM products"
-            ).fetchone()[0]
-
-        try:
-            os.remove(filepath)
-        except OSError:
-            pass
-
-        return jsonify({
-            "success": True,
-            "new_added": new_added,
-            "existing_updated": existing_updated,
-            "total_products": total_products,
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')),debug=False)

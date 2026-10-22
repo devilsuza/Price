@@ -54,10 +54,19 @@ def init_db():
                 article_code TEXT NOT NULL, item_name TEXT NOT NULL,
                 price TEXT NOT NULL, unit TEXT NOT NULL DEFAULT 'UN',
                 currency TEXT NOT NULL DEFAULT 'KZ', copies INTEGER NOT NULL DEFAULT 1,
+                printer_id TEXT NOT NULL DEFAULT 'epson',
+                printer_name TEXT,
                 status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
                 claimed_at TEXT, printed_at TEXT, error_message TEXT
             )
         """)
+        # Safe migration for databases created by the original single-printer version.
+        print_job_columns = {r[1] for r in conn.execute("PRAGMA table_info(print_jobs)").fetchall()}
+        if "printer_id" not in print_job_columns:
+            conn.execute("ALTER TABLE print_jobs ADD COLUMN printer_id TEXT NOT NULL DEFAULT 'epson'")
+        if "printer_name" not in print_job_columns:
+            conn.execute("ALTER TABLE print_jobs ADD COLUMN printer_name TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_printer_status ON print_jobs(printer_id, status, id)")
         conn.commit()
 
 
@@ -4769,6 +4778,25 @@ HTML_TEMPLATE = """
             }
             ticket.copies = copies;
 
+            // Route this job to one specific bridge. Existing EPSON bridge remains
+            // compatible because jobs without an explicit route default to EPSON.
+            const printerChoice = prompt(
+                "Select printer:\n1 = EPSON label printer\n2 = HP Laser MFP 131 133 135-138",
+                "1"
+            );
+            if (printerChoice === null) return;
+            const normalizedPrinter = String(printerChoice).trim().toLowerCase();
+            if (["2", "hp", "hp_135w"].includes(normalizedPrinter)) {
+                ticket.printer_id = "hp_135w";
+                ticket.printer_name = "HP Laser MFP 131 133 135-138";
+            } else if (["1", "epson"].includes(normalizedPrinter)) {
+                ticket.printer_id = "epson";
+                ticket.printer_name = "EPSON Printer";
+            } else {
+                alert("Please enter 1 for EPSON or 2 for HP.");
+                return;
+            }
+
             const status=document.getElementById('print-status');
             status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-amber-50 text-amber-800 border border-amber-300';
             status.textContent=`⏳ Sending ${copies} label${copies > 1 ? 's' : ''} to printer...`;
@@ -4777,7 +4805,7 @@ HTML_TEMPLATE = """
                 const data=await res.json();
                 if(res.ok && data.success){
                     status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-800 border border-emerald-300';
-                    status.textContent=`✅ ${data.copies} label${data.copies > 1 ? 's' : ''} queued. Print job #${data.job_id} sent to EPSON printer.`;
+                    status.textContent=`✅ ${data.copies} label${data.copies > 1 ? 's' : ''} queued. Print job #${data.job_id} routed to ${data.printer_name}.`;
                 } else {
                     status.className='mt-3 p-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-300';
                     status.textContent='❌ '+(data.error||'Print job failed');
@@ -5354,10 +5382,18 @@ def create_print_job():
         return jsonify({"success":False,"error":"Quantity must be a whole number"}),400
     if copies < 1 or copies > 100:
         return jsonify({"success":False,"error":"Quantity must be between 1 and 100"}),400
+    printers = {
+        "epson": "EPSON Printer",
+        "hp_135w": "HP Laser MFP 131 133 135-138",
+    }
+    printer_id = str(data.get("printer_id", "epson")).strip().lower()
+    if printer_id not in printers:
+        return jsonify({"success":False,"error":"Unknown printer"}),400
+    printer_name = printers[printer_id]
     with sqlite3.connect(DB_NAME) as conn:
-        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,status,created_at) VALUES(?,?,?,?,?,?,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),copies,datetime.now().isoformat(timespec='seconds')))
+        cur=conn.execute("INSERT INTO print_jobs(article_code,item_name,price,unit,currency,copies,printer_id,printer_name,status,created_at) VALUES(?,?,?,?,?,?,?,?,'pending',?)",(str(data['article_code']),str(data['item_name']),str(data['price']),str(data.get('unit','UN')),str(data.get('currency','KZ')),copies,printer_id,printer_name,datetime.now().isoformat(timespec='seconds')))
         conn.commit()
-    return jsonify({"success":True,"job_id":cur.lastrowid,"copies":copies})
+    return jsonify({"success":True,"job_id":cur.lastrowid,"copies":copies,"printer_id":printer_id,"printer_name":printer_name})
 
 def _bridge_ok():
     key=os.environ.get("PRINT_BRIDGE_KEY","")
@@ -5366,12 +5402,17 @@ def _bridge_ok():
 @app.route("/api/print-jobs/next")
 def next_print_job():
     if not _bridge_ok(): return jsonify({"success":False,"error":"Unauthorized"}),401
+    # Backward compatible: the existing EPSON bridge does not send printer_id,
+    # so it automatically receives only EPSON jobs. The HP bridge sends hp_135w.
+    printer_id = str(request.args.get("printer_id", "epson")).strip().lower()
+    if printer_id not in ("epson", "hp_135w"):
+        return jsonify({"success":False,"error":"Unknown printer"}),400
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory=sqlite3.Row; conn.execute("BEGIN IMMEDIATE")
-        row=conn.execute("SELECT * FROM print_jobs WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
-        if not row: conn.commit(); return jsonify({"success":True,"job":None})
+        row=conn.execute("SELECT * FROM print_jobs WHERE status='pending' AND COALESCE(printer_id,'epson')=? ORDER BY id LIMIT 1",(printer_id,)).fetchone()
+        if not row: conn.commit(); return jsonify({"success":True,"job":None,"printer_id":printer_id})
         conn.execute("UPDATE print_jobs SET status='claimed',claimed_at=? WHERE id=?",(datetime.now().isoformat(timespec='seconds'),row['id'])); conn.commit()
-    return jsonify({"success":True,"job":dict(row)})
+    return jsonify({"success":True,"job":dict(row),"printer_id":printer_id})
 
 @app.route("/api/print-jobs/<int:job_id>/complete",methods=["POST"])
 def complete_print_job(job_id):
